@@ -21,13 +21,58 @@ use axum::{
 
 use camino::{Utf8Path, Utf8PathBuf};
 use hex::FromHexError;
+use indexmap::IndexSet;
 use rand::Rng;
 
 use tokio::sync::{Mutex, RwLock};
 
+type InternKey = usize;
+
 #[derive(Debug, Default)]
 struct ImportTree {
-    imports: HashMap<Utf8PathBuf, ImportTree>,
+    intern: IndexSet<Utf8PathBuf>,
+    imports: HashMap<InternKey, Vec<InternKey>>,
+    imported: HashMap<InternKey, Vec<InternKey>>,
+}
+
+impl ImportTree {
+    fn insert_cydet(
+        &mut self,
+        root: Utf8PathBuf,
+        imports: Utf8PathBuf,
+    ) -> Result<(), Vec<Utf8PathBuf>> {
+        let root = self.intern.insert_full(root).0;
+        let imports = self.intern.insert_full(imports).0;
+
+        self.imports.entry(root).or_default().push(imports);
+        self.imported.entry(imports).or_default().push(root);
+
+        let goal = imports;
+
+        let mut stack = vec![vec![root]];
+
+        while let Some(n) = stack.pop() {
+            let last = n.last().unwrap();
+
+            if *last == goal {
+                return Err(n
+                    .into_iter()
+                    .map(|v| self.intern.get_index(v).unwrap().clone())
+                    .collect());
+            }
+
+            if let Some(used) = self.imported.get(last) {
+                for i in used {
+                    let mut new = n.clone();
+                    new.push(*i);
+
+                    stack.push(new);
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Eq, Hash, PartialEq)]
@@ -167,14 +212,25 @@ async fn imports(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     };
 
+    if let Err(cycle) = state.import_tree.lock().await.insert_cydet(last.clone(), fpath) {
 
 
+
+    }
 
     Ok(())
 }
 
 #[axum::debug_handler]
 async fn exports(
+    Path((_, key, params)): Path<(String, String, String)>,
+    State(state): State<Arc<HurlinState>>,
+) -> impl IntoResponse {
+    println!("params: {params:?}");
+}
+
+#[axum::debug_handler]
+async fn noise(
     Path((_, key, params)): Path<(String, String, String)>,
     State(state): State<Arc<HurlinState>>,
 ) -> impl IntoResponse {
@@ -195,6 +251,7 @@ async fn main() {
     let app = Router::new()
         .route("/import/:fuzz_key/:taskid/*params", get(imports))
         .route("/export/:fuzz_key/:taskid/*params", get(exports))
+        .route("/noise/:fuzz_key/:taskid/*params", get(noise))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             fuzz_assert,

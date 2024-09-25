@@ -380,6 +380,7 @@ dependencies = [
  "camino",
  "cap-std",
  "hex",
+ "indexmap",
  "rand",
  "tokio",
 ]
