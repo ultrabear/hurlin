@@ -8,6 +8,7 @@ edition = "2021"
 opt-level = 3
 
 [dependencies]
+ascii = "1.1.0"
 axum = { version = "0.7.6", features = ["macros", "http2"] }
 camino = { version = "1.1.9", features = ["serde1"] }
 cap-std = { version = "3.2.0", features = ["fs_utf8"] }

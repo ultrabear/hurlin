@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use core::fmt;
 use std::{
     collections::HashMap,
     future::{Future, IntoFuture},
@@ -9,10 +10,11 @@ use std::{
     sync::Arc,
 };
 
+use ascii::AsciiChar;
 use axum::{
-    body::Bytes,
+    body::{Body, Bytes, HttpBody},
     extract::{Path, Request, State},
-    http::StatusCode,
+    http::{header, HeaderName, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     routing::method_routing::get,
@@ -44,9 +46,6 @@ impl ImportTree {
         let root = self.intern.insert_full(root).0;
         let imports = self.intern.insert_full(imports).0;
 
-        self.imports.entry(root).or_default().push(imports);
-        self.imported.entry(imports).or_default().push(root);
-
         let goal = imports;
 
         let mut stack = vec![vec![root]];
@@ -71,46 +70,97 @@ impl ImportTree {
             }
         }
 
+        self.imports.entry(root).or_default().push(imports);
+        self.imported.entry(imports).or_default().push(root);
+
         Ok(())
     }
 }
 
-#[derive(Eq, Hash, PartialEq)]
-struct TaskId([u8; 8]);
+#[derive(Eq, Hash, PartialEq, Copy, Clone)]
+struct HexKey([u8; 16]);
 
-impl TaskId {
-    fn to_string(&self) -> String {
-        hex::encode(&self.0)
+impl HexKey {
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.0).unwrap()
     }
 
-    fn from_string(s: &str) -> Result<Self, ()> {
-        if let Ok(data) = hex::decode(s) {
-            Ok(Self(data.as_slice().try_into().map_err(|_| ())?))
+    fn matches(&self, other: &str) -> bool {
+        self.0 == other.as_bytes()
+    }
+
+    fn validate(data: &str) -> Result<Self, ()> {
+        let Ok(bytes) = <[u8; 16]>::try_from(data.as_bytes()) else {
+            return Err(());
+        };
+
+        if bytes.iter().all(|b| b.is_ascii_hexdigit()) {
+            return Ok(Self(bytes));
         } else {
-            Err(())
+            return Err(());
         }
     }
 
     /// generates a new random taskid
     fn new() -> Self {
-        Self(rand::thread_rng().gen())
+        let data: [u8; 8] = rand::thread_rng().gen();
+
+        Self(hex::encode(&data).as_bytes().try_into().unwrap())
     }
 }
 
+macro_rules! basically_hexkey {
+    ($type:ident) => {
+        #[derive(Eq, Hash, PartialEq, Copy, Clone)]
+        struct $type(HexKey);
+
+        impl $type {
+            fn as_str(&self) -> &str {
+                self.0.as_str()
+            }
+
+            fn matches(&self, other: &str) -> bool {
+                self.0.matches(other)
+            }
+
+            fn validate(data: &str) -> Result<Self, ()> {
+                HexKey::validate(data).map(Self)
+            }
+
+            fn new() -> Self {
+                Self(HexKey::new())
+            }
+        }
+
+        impl fmt::Display for $type {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}", self.as_str())
+            }
+        }
+    };
+}
+
+basically_hexkey!(HurlinKey);
+basically_hexkey!(TaskId);
+
+struct ContentTypedBody(Bytes, String);
+
 struct HurlinState {
-    key: [u8; 16],
-    import_cache: Mutex<HashMap<Utf8PathBuf, Arc<Mutex<Option<(Bytes, String)>>>>>,
+    key: HurlinKey,
+    import_cache: Mutex<HashMap<Utf8PathBuf, Arc<Mutex<Option<ContentTypedBody>>>>>,
     import_tree: Mutex<ImportTree>,
     running_tasks: RwLock<HashMap<TaskId, Vec<Utf8PathBuf>>>,
+    exports: Mutex<HashMap<TaskId, ContentTypedBody>>,
 }
 
 impl HurlinState {
-    fn new(key: [u8; 16]) -> Self {
+    fn new(key: HurlinKey) -> Self {
         Self {
             key,
             import_cache: Default::default(),
             import_tree: Default::default(),
             running_tasks: Default::default(),
+            exports: Default::default(),
         }
     }
 }
@@ -122,7 +172,7 @@ async fn fuzz_assert(
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    if fuzz_key.as_bytes() == state.key {
+    if state.key.0.matches(&fuzz_key) {
         Ok(next.run(req).await)
     } else {
         Err(StatusCode::FORBIDDEN)
@@ -133,7 +183,9 @@ struct HurlVar(String);
 struct HurlVarName(String);
 
 impl HurlVarName {
-    fn new(s: String) -> Result<Self, String> {
+    fn new(s: impl Into<String>) -> Result<Self, String> {
+        let s = s.into();
+
         // ref: https://hurl.dev/docs/grammar.html
 
         // must be ascii so we can just cheat
@@ -163,7 +215,7 @@ impl HurlVarName {
 
 fn hurl_call(
     file: Utf8PathBuf,
-    variables: &[(HurlVarName, HurlVar)],
+    variables: impl Iterator<Item = (HurlVarName, HurlVar)>,
 ) -> impl Future<Output = Result<ExitStatus, io::Error>> {
     let mut p = tokio::process::Command::new("hurl");
 
@@ -176,12 +228,24 @@ fn hurl_call(
     p.status()
 }
 
+async fn hurlin_spawn(
+    file: Utf8PathBuf,
+    variables: impl IntoIterator<Item = (HurlVarName, HurlVar)>,
+    key: HurlinKey,
+    task: TaskId,
+) {
+    let vars = [(
+        HurlVarName::new("hurlin-import").unwrap(),
+        HurlVar(format!("/import/{key}/{task}/")),
+    )];
+}
+
 #[axum::debug_handler]
 async fn imports(
     Path((_, key, params)): Path<(String, String, Utf8PathBuf)>,
     State(state): State<Arc<HurlinState>>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let Ok(task) = TaskId::from_string(&key) else {
+    let Ok(task) = TaskId::validate(&key) else {
         eprintln!("Request unauthorized: unparsable task_id: {key:?}");
         return Err(StatusCode::UNAUTHORIZED);
     };
@@ -193,7 +257,7 @@ async fn imports(
         return Err(StatusCode::UNAUTHORIZED);
     };
 
-    let ptree = ptree.clone();
+    let mut ptree = ptree.clone();
     drop(rlock);
 
     let last = ptree.last().expect("import chain tree cannot be empty");
@@ -212,13 +276,52 @@ async fn imports(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     };
 
-    if let Err(cycle) = state.import_tree.lock().await.insert_cydet(last.clone(), fpath) {
-
-
-
+    if let Err(cycle) = state
+        .import_tree
+        .lock()
+        .await
+        .insert_cydet(last.clone(), fpath.clone())
+    {
+        eprintln!("Cycle detected in import chain:");
+        eprintln!("...Attempted to import {fpath}");
+        for path in cycle {
+            eprintln!("...Which is imported by {path}");
+        }
+        return Err(StatusCode::FAILED_DEPENDENCY);
     }
 
-    Ok(())
+    let mut cache = state.import_cache.lock().await;
+
+    let arc = cache.entry(fpath.clone()).or_default().clone();
+
+    let file_owner = arc.lock().await;
+
+    drop(cache);
+
+    match &*file_owner {
+        Some(ContentTypedBody(data, mime)) => {
+            return Ok(([(header::CONTENT_TYPE, mime.clone())], data.clone()).into_response());
+        }
+        None => {
+            let mut tasks = state.running_tasks.write().await;
+
+            let mut task_id = TaskId::new();
+
+            // ensure no collisions
+            while tasks.contains_key(&task_id) {
+                task_id = TaskId::new();
+            }
+
+            ptree.push(fpath);
+            tasks.insert(task_id, ptree);
+
+            drop(tasks);
+
+            tokio::spawn(async {});
+        }
+    };
+
+    Ok(().into_response())
 }
 
 #[axum::debug_handler]
@@ -239,12 +342,9 @@ async fn noise(
 
 #[tokio::main]
 async fn main() {
-    let fuzz_raw: [u8; 8] = rand::thread_rng().gen();
-    let mut fuzz_key = [0; 16];
+    let mut fuzz_key = HurlinKey::new();
 
-    hex::encode_to_slice(fuzz_raw, &mut fuzz_key).unwrap();
-
-    println!("{}", core::str::from_utf8(&fuzz_key).unwrap());
+    println!("{}", fuzz_key);
 
     let state = Arc::new(HurlinState::new(fuzz_key));
 
