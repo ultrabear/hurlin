@@ -12,7 +12,10 @@ ascii = "1.1.0"
 axum = { version = "0.7.6", features = ["macros", "http2"] }
 camino = { version = "1.1.9", features = ["serde1"] }
 cap-std = { version = "3.2.0", features = ["fs_utf8"] }
+clap = { version = "4.5.18", features = ["derive"] }
 hex = "0.4.3"
 indexmap = "2.5.0"
 rand = "0.8.5"
 tokio = { version = "1.40.0", features = ["full"] }
+tower-http = { version = "0.6.1", features = ["trace"] }
+tracing-subscriber = "0.3.18"

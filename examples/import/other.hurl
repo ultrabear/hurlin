@@ -1,5 +1,5 @@
 POST {{hurlin-export}}
 {
-  "foo": "hiiiii",
+  "foo": "hiiiii"
 }
 HTTP 200

@@ -12,21 +12,28 @@ use std::{
 
 use ascii::AsciiChar;
 use axum::{
+    async_trait,
     body::{Body, Bytes, HttpBody},
     extract::{Path, Request, State},
-    http::{header, HeaderName, StatusCode},
+    http::{
+        header::{self, CONTENT_TYPE},
+        request::Parts,
+        HeaderName, StatusCode,
+    },
     middleware::Next,
     response::{IntoResponse, Response},
-    routing::method_routing::get,
-    Router,
+    routing::{method_routing::get, post},
+    RequestPartsExt, Router,
 };
 
 use camino::{Utf8Path, Utf8PathBuf};
+use clap::Parser;
 use hex::FromHexError;
 use indexmap::IndexSet;
 use rand::Rng;
 
 use tokio::sync::{Mutex, RwLock};
+use tower_http::trace::TraceLayer;
 
 type InternKey = usize;
 
@@ -147,6 +154,7 @@ struct ContentTypedBody(Bytes, String);
 
 struct HurlinState {
     key: HurlinKey,
+    port: u16,
     import_cache: Mutex<HashMap<Utf8PathBuf, Arc<Mutex<Option<ContentTypedBody>>>>>,
     import_tree: Mutex<ImportTree>,
     running_tasks: RwLock<HashMap<TaskId, Vec<Utf8PathBuf>>>,
@@ -154,28 +162,15 @@ struct HurlinState {
 }
 
 impl HurlinState {
-    fn new(key: HurlinKey) -> Self {
+    fn new(key: HurlinKey, port: u16) -> Self {
         Self {
             key,
+            port,
             import_cache: Default::default(),
             import_tree: Default::default(),
             running_tasks: Default::default(),
             exports: Default::default(),
         }
-    }
-}
-
-#[axum::debug_middleware]
-async fn fuzz_assert(
-    Path((fuzz_key, _, _)): Path<(String, String, String)>,
-    State(state): State<Arc<HurlinState>>,
-    req: Request,
-    next: Next,
-) -> Result<Response, StatusCode> {
-    if state.key.0.matches(&fuzz_key) {
-        Ok(next.run(req).await)
-    } else {
-        Err(StatusCode::FORBIDDEN)
     }
 }
 
@@ -213,6 +208,47 @@ impl HurlVarName {
     }
 }
 
+struct HurlinRPC(HurlinKey, TaskId, Option<String>);
+
+#[async_trait]
+impl axum::extract::FromRequestParts<Arc<HurlinState>> for HurlinRPC {
+    type Rejection = StatusCode;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<HurlinState>,
+    ) -> Result<Self, Self::Rejection> {
+        let rpc = match parts.extract::<Path<(String, String, String)>>().await {
+            Ok(Path((key, task, rpc))) => Self(
+                HurlinKey::validate(&key).map_err(|()| StatusCode::BAD_REQUEST)?,
+                TaskId::validate(&task).map_err(|()| StatusCode::BAD_REQUEST)?,
+                Some(rpc),
+            ),
+            Err(_) => {
+                let Ok(Path((key, task))) = parts.extract::<Path<(String, String)>>().await else {
+                    return Err(StatusCode::BAD_REQUEST);
+                };
+
+                Self(
+                    HurlinKey::validate(&key).map_err(|()| StatusCode::BAD_REQUEST)?,
+                    TaskId::validate(&task).map_err(|()| StatusCode::BAD_REQUEST)?,
+                    None,
+                )
+            }
+        };
+
+        if rpc.0 != state.key {
+            return Err(StatusCode::FORBIDDEN);
+        }
+
+        if !state.running_tasks.write().await.contains_key(&rpc.1) {
+            return Err(StatusCode::BAD_REQUEST);
+        };
+
+        Ok(rpc)
+    }
+}
+
 fn hurl_call(
     file: Utf8PathBuf,
     variables: impl Iterator<Item = (HurlVarName, HurlVar)>,
@@ -225,35 +261,41 @@ fn hurl_call(
 
     p.arg(file);
 
+    
+    println!("{:?}", p.as_std().get_args());
+
     p.status()
 }
 
-async fn hurlin_spawn(
+fn hurlin_spawn(
     file: Utf8PathBuf,
     variables: impl IntoIterator<Item = (HurlVarName, HurlVar)>,
     key: HurlinKey,
+    port: u16,
     task: TaskId,
-) {
-    let vars = [(
-        HurlVarName::new("hurlin-import").unwrap(),
-        HurlVar(format!("/import/{key}/{task}/")),
-    )];
+) -> impl Future<Output = Result<ExitStatus, io::Error>> {
+    let vars = [
+        (
+            HurlVarName::new("hurlin-import").unwrap(),
+            HurlVar(format!("http://localhost:{port}/import/{key}/{task}/")),
+        ),
+        (
+            HurlVarName::new("hurlin-export").unwrap(),
+            HurlVar(format!("http://localhost:{port}/export/{key}/{task}")),
+        ),
+    ];
+
+    return hurl_call(file, variables.into_iter().chain(vars));
 }
 
 #[axum::debug_handler]
 async fn imports(
-    Path((_, key, params)): Path<(String, String, Utf8PathBuf)>,
+    HurlinRPC(_, task, path): HurlinRPC,
     State(state): State<Arc<HurlinState>>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let Ok(task) = TaskId::validate(&key) else {
-        eprintln!("Request unauthorized: unparsable task_id: {key:?}");
-        return Err(StatusCode::UNAUTHORIZED);
-    };
-
     let rlock = state.running_tasks.read().await;
 
     let Some(ptree) = rlock.get(&task) else {
-        eprintln!("Request unathorized: task {key:?} does not exist in running pool");
         return Err(StatusCode::UNAUTHORIZED);
     };
 
@@ -269,6 +311,7 @@ async fn imports(
 
     let mut dir = dir.to_path_buf();
 
+    let params = Utf8PathBuf::from(path.unwrap_or(String::new()));
     dir.push(params);
 
     let Ok(fpath) = dir.canonicalize_utf8() else {
@@ -294,7 +337,7 @@ async fn imports(
 
     let arc = cache.entry(fpath.clone()).or_default().clone();
 
-    let file_owner = arc.lock().await;
+    let mut file_owner = arc.lock().await;
 
     drop(cache);
 
@@ -312,24 +355,59 @@ async fn imports(
                 task_id = TaskId::new();
             }
 
-            ptree.push(fpath);
+            ptree.push(fpath.clone());
             tasks.insert(task_id, ptree);
 
             drop(tasks);
 
-            tokio::spawn(async {});
+            if !hurlin_spawn(fpath, [], state.key, state.port, task_id)
+                .await
+                .unwrap().success() {
+                eprintln!("Hurl task {task_id} failed to run to completion");
+                return Err(StatusCode::FAILED_DEPENDENCY);
+            }
+
+            if let Some(res) = state.exports.lock().await.remove(&task_id) {
+                let data = file_owner.insert(res);
+
+                return Ok(
+                    ([(header::CONTENT_TYPE, data.1.clone())], data.0.clone()).into_response()
+                );
+            } else {
+                return Ok(().into_response());
+            }
         }
     };
-
-    Ok(().into_response())
 }
 
 #[axum::debug_handler]
 async fn exports(
-    Path((_, key, params)): Path<(String, String, String)>,
+    HurlinRPC(_, task_id, path): HurlinRPC,
     State(state): State<Arc<HurlinState>>,
-) -> impl IntoResponse {
-    println!("params: {params:?}");
+    parts: Request,
+) -> Result<impl IntoResponse, StatusCode> {
+
+    if let Some(ty) = parts.headers().get(header::CONTENT_TYPE) {
+        let Ok(mime) = ty.to_str().map(String::from) else {
+            eprintln!("CONTENT_TYPE provided but not ascii");
+            return Err(StatusCode::BAD_REQUEST);
+        };
+
+        let body = parts.into_body();
+
+        let Ok(bytes) = axum::body::to_bytes(body, 4_000_000).await else {
+            eprintln!("Body exceeds 4MB in size");
+            return Err(StatusCode::BAD_REQUEST);
+        };
+
+        state
+            .exports
+            .lock()
+            .await
+            .insert(task_id, ContentTypedBody(bytes, mime));
+    }
+
+    Ok(())
 }
 
 #[axum::debug_handler]
@@ -340,35 +418,52 @@ async fn noise(
     println!("params: {params:?}");
 }
 
+#[derive(clap::Parser)]
+/// MVP: a bolt on hurl wrapper with enhanced functionality
+struct Args {
+    /// file to treat as the root node
+    file: Utf8PathBuf,
+}
+
 #[tokio::main]
 async fn main() {
-    let mut fuzz_key = HurlinKey::new();
+    tracing_subscriber::fmt::init();
 
-    println!("{}", fuzz_key);
+    let args = Args::parse();
 
-    let state = Arc::new(HurlinState::new(fuzz_key));
+    let fuzz_key = HurlinKey::new();
 
-    let app = Router::new()
-        .route("/import/:fuzz_key/:taskid/*params", get(imports))
-        .route("/export/:fuzz_key/:taskid/*params", get(exports))
-        .route("/noise/:fuzz_key/:taskid/*params", get(noise))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            fuzz_assert,
-        ))
-        .with_state(state);
-
-    let port = tokio::net::TcpListener::bind((Ipv4Addr::from_bits(0), 0))
+    let addr = tokio::net::TcpListener::bind((Ipv4Addr::from_bits(0), 0))
         .await
         .unwrap();
 
-    println!("{}", port.local_addr().unwrap().port());
+    let port = addr.local_addr().unwrap().port();
 
-    let server = tokio::spawn(axum::serve(port, app).into_future());
+    let state = Arc::new(HurlinState::new(fuzz_key, port));
 
-    process::Command::new("fish").status();
+    let app = Router::new()
+        .route("/import/:fuzz_key/:taskid/*params", get(imports))
+        .route("/export/:fuzz_key/:taskid", post(exports))
+        .route("/noise/:fuzz_key/:taskid/*params", get(noise))
+        .layer(TraceLayer::new_for_http())
+        .with_state(state.clone());
 
-    println!("exiting hurlin");
+    let server = tokio::spawn(axum::serve(addr, app).into_future());
+
+    println!("HurlinKey for this session: {}", fuzz_key);
+    println!("Starting local server on port {}", port);
+
+    let root = TaskId::new();
+
+    state
+        .running_tasks
+        .write()
+        .await
+        .insert(root, vec![args.file.clone()]);
+
+    hurlin_spawn(args.file, [], fuzz_key, port, root)
+        .await
+        .unwrap();
 
     server.abort();
 }
