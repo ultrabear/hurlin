@@ -1,5 +1,11 @@
+
+GET {{hurlin-import}}./nest.hurl
+HTTP 200
+[Captures]
+noise: jsonpath "$.our_noise"
+
 POST {{hurlin-export}}
 {
-  "foo": "hiiiii"
+  "foo": "{{noise}}"
 }
 HTTP 200
