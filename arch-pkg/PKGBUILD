@@ -1,5 +1,5 @@
 pkgname="hurlin"
-pkgver="0.1.0"
+pkgver="0.1.1"
 pkgrel="1"
 pkgdesc="A hurl runner with an HTTP library to import and export from native hurl"
 arch=("x86_64")

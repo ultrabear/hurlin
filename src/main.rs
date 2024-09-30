@@ -473,15 +473,8 @@ async fn run_cacheable_hurlin_task(
     file_path: FileNameRef,
     call_stack: Vec<FileNameRef>,
     cache_args: HurlinImportArgs,
+    file_owner: OwnedMutexGuard<CacheEntry>,
 ) -> Result<Response, StatusCode> {
-    let mut cache = state.import_cache.lock().await;
-
-    let arc = cache.entry(file_path.clone()).or_default().clone();
-
-    let file_owner = arc.lock_owned().await;
-
-    drop(cache);
-
     if cache_args.rerun() {
         run_hurlin_task(
             file_path,
@@ -581,8 +574,15 @@ async fn imports(
         task_name.clone(),
         imports.clone(),
     )?;
+    let mut cache = state.import_cache.lock().await;
 
-    run_cacheable_hurlin_task(state, imports, call_stack, cache_args).await
+    let arc = cache.entry(imports.clone()).or_default().clone();
+
+    let file_owner = arc.lock_owned().await;
+
+    drop(cache);
+
+    run_cacheable_hurlin_task(state, imports, call_stack, cache_args, file_owner).await
 }
 
 #[axum::debug_handler]
@@ -617,8 +617,17 @@ async fn hurlin_async_call(
 
     drop(async_map);
 
+    let mut cache = state.import_cache.lock().await;
+
+    let arc = cache.entry(imports.clone()).or_default().clone();
+
+    let file_owner = arc.lock_owned().await;
+
+    drop(cache);
+
     tokio::spawn(async move {
-        let res = run_cacheable_hurlin_task(state, imports, call_stack, cache_args).await;
+        let res =
+            run_cacheable_hurlin_task(state, imports, call_stack, cache_args, file_owner).await;
 
         *async_key_data = Some(res.into_response());
     });
