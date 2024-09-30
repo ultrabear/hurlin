@@ -699,6 +699,7 @@ async fn noise(_: HurlinRPC) -> impl IntoResponse {
 
 #[derive(clap::Parser)]
 /// MVP: a bolt on hurl wrapper with enhanced functionality
+#[clap(version)]
 struct Args {
     /// file to treat as the root node
     file: Utf8PathBuf,
