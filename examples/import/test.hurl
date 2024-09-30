@@ -1,10 +1,10 @@
-GET {{hurlin-import}}../import/other.hurl
+GET {{hurlin-async}}./other.hurl
 HTTP 200
 [Captures]
-json_key: jsonpath "$.foo"
+key: jsonpath "$.await"
 
 
-GET {{hurlin-import}}./other.hurl
-HTTP 200 
+GET {{hurlin-await}}{{key}}
+HTTP 200
 [Captures]
 json_key: jsonpath "$.foo"
