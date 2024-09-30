@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use core::fmt;
 use std::{
     collections::HashMap,
@@ -8,7 +6,10 @@ use std::{
     io::{self, Write},
     net::Ipv4Addr,
     process::{self, ExitCode},
-    sync::Arc,
+    sync::{
+        atomic::{self, AtomicU64},
+        Arc,
+    },
 };
 
 use axum::{
@@ -95,10 +96,6 @@ impl HexKey {
         core::str::from_utf8(&self.0).unwrap()
     }
 
-    fn matches(&self, other: &str) -> bool {
-        self.0 == other.as_bytes()
-    }
-
     fn validate(data: &str) -> Result<Self, ()> {
         let Ok(bytes) = <[u8; 16]>::try_from(data.as_bytes()) else {
             return Err(());
@@ -127,10 +124,6 @@ macro_rules! basically_hexkey {
         impl $type {
             fn as_str(&self) -> &str {
                 self.0.as_str()
-            }
-
-            fn matches(&self, other: &str) -> bool {
-                self.0.matches(other)
             }
 
             fn validate(data: &str) -> Result<Self, ()> {
@@ -182,6 +175,7 @@ struct HurlinState {
     key: HurlinKey,
     port: u16,
     hurl_args: Arc<[String]>,
+    hurl_calls: AtomicU64,
     import_cache: Mutex<HashMap<Utf8PathBuf, Locked<CacheEntry>>>,
     import_tree: Mutex<ImportTree>,
     running_tasks: RwLock<HashMap<TaskId, Vec<Utf8PathBuf>>>,
@@ -195,6 +189,7 @@ impl HurlinState {
             key,
             port,
             hurl_args,
+            hurl_calls: AtomicU64::new(0),
             import_cache: Default::default(),
             import_tree: Default::default(),
             running_tasks: Default::default(),
@@ -351,11 +346,15 @@ fn hurl_call(
 fn hurlin_spawn(
     file: Utf8PathBuf,
     variables: impl IntoIterator<Item = (HurlVarName, HurlVar)>,
-    args: Arc<[String]>,
-    key: HurlinKey,
-    port: u16,
+    state: Arc<HurlinState>,
     task: TaskId,
 ) -> impl Future<Output = Result<process::Output, io::Error>> {
+    let port = state.port;
+    let key = state.key;
+    let args = state.hurl_args.clone();
+
+    state.hurl_calls.fetch_add(1, atomic::Ordering::Relaxed);
+
     let vars = [
         (
             HurlVarName::new("hurlin-import").unwrap(),
@@ -429,16 +428,9 @@ async fn run_hurlin_task(
 
     drop(tasks);
 
-    let res = hurlin_spawn(
-        file_path.clone(),
-        [],
-        state.hurl_args.clone(),
-        state.key,
-        state.port,
-        task_id,
-    )
-    .await
-    .unwrap();
+    let res = hurlin_spawn(file_path.clone(), [], state.clone(), task_id)
+        .await
+        .unwrap();
 
     state.running_tasks.write().await.remove(&task_id);
 
@@ -759,14 +751,17 @@ async fn main() -> ExitCode {
         .await
         .insert(root, vec![root_f.clone()]);
 
-    let res = hurlin_spawn(root_f, [], hurl_args, fuzz_key, port, root)
-        .await
-        .unwrap();
+    let res = hurlin_spawn(root_f, [], state.clone(), root).await.unwrap();
 
     _ = std::io::stdout().lock().write_all(&res.stdout);
     _ = std::io::stderr().lock().write_all(&res.stderr);
 
     server.abort();
+
+    tracing::debug!(
+        "Hurl was spawned {} time(s)",
+        state.hurl_calls.load(atomic::Ordering::Relaxed)
+    );
 
     if !res.status.success() {
         eprintln!("Root hurlin task failed to run to completion");
