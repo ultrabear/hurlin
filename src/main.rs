@@ -476,13 +476,9 @@ async fn run_cacheable_hurlin_task(
     file_owner: OwnedMutexGuard<CacheEntry>,
 ) -> Result<Response, StatusCode> {
     if cache_args.rerun() {
-        run_hurlin_task(
-            file_path,
-            call_stack,
-            cache_args.cache_run().then_some(file_owner),
-            state.clone(),
-        )
-        .await
+        // drop early if not needed
+        let file_owner = cache_args.cache_run().then_some(file_owner);
+        run_hurlin_task(file_path, call_stack, file_owner, state.clone()).await
     } else {
         match &*file_owner {
             // cached with no response body/export
