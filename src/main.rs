@@ -20,7 +20,7 @@ use axum::{
         request::Parts,
         StatusCode,
     },
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{method_routing::get, post},
     RequestPartsExt, Router,
 };
@@ -30,10 +30,12 @@ use clap::Parser;
 use indexmap::IndexSet;
 use rand::Rng;
 
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 use tower_http::trace::TraceLayer;
 
 type InternKey = usize;
+// make it easier to intern later lolol
+type FileNameRef = Utf8PathBuf;
 
 #[derive(Debug, Default)]
 struct ImportTree {
@@ -148,9 +150,28 @@ macro_rules! basically_hexkey {
 basically_hexkey!(HurlinKey);
 basically_hexkey!(TaskId);
 
+impl HurlinKey {
+    fn validate_or_log(data: &str) -> Result<Self, StatusCode> {
+        Self::validate(data).map_err(|_| {
+            tracing::error!("Failed to parse HurlinKey");
+            StatusCode::BAD_REQUEST
+        })
+    }
+}
+
+impl TaskId {
+    fn validate_or_log(data: &str) -> Result<Self, StatusCode> {
+        Self::validate(data).map_err(|_| {
+            tracing::error!("Failed to parse TaskId");
+            StatusCode::BAD_REQUEST
+        })
+    }
+}
+
 struct TypedBody(Bytes, String);
 
-type CacheEntry = Arc<Mutex<Option<Result<Option<TypedBody>, StatusCode>>>>;
+type UnlockedCacheEntry = Option<Result<Option<TypedBody>, StatusCode>>;
+type CacheEntry = Arc<Mutex<UnlockedCacheEntry>>;
 
 struct HurlinState {
     key: HurlinKey,
@@ -224,8 +245,8 @@ impl axum::extract::FromRequestParts<Arc<HurlinState>> for HurlinRPC {
     ) -> Result<Self, Self::Rejection> {
         let rpc = match parts.extract::<Path<(String, String, String)>>().await {
             Ok(Path((key, task, rpc))) => Self(
-                HurlinKey::validate(&key).map_err(|()| StatusCode::BAD_REQUEST)?,
-                TaskId::validate(&task).map_err(|()| StatusCode::BAD_REQUEST)?,
+                HurlinKey::validate_or_log(&key)?,
+                TaskId::validate_or_log(&task)?,
                 Some(rpc),
             ),
             Err(_) => {
@@ -234,18 +255,20 @@ impl axum::extract::FromRequestParts<Arc<HurlinState>> for HurlinRPC {
                 };
 
                 Self(
-                    HurlinKey::validate(&key).map_err(|()| StatusCode::BAD_REQUEST)?,
-                    TaskId::validate(&task).map_err(|()| StatusCode::BAD_REQUEST)?,
+                    HurlinKey::validate_or_log(&key)?,
+                    TaskId::validate_or_log(&task)?,
                     None,
                 )
             }
         };
 
         if rpc.0 != state.key {
+            tracing::error!("Request sent with invalid HurlinKey");
             return Err(StatusCode::FORBIDDEN);
         }
 
         if !state.running_tasks.read().await.contains_key(&rpc.1) {
+            tracing::error!("Request sent with invalid TaskId");
             return Err(StatusCode::BAD_REQUEST);
         };
 
@@ -286,11 +309,11 @@ fn hurlin_spawn(
         ),
         (
             HurlVarName::new("hurlin-export").unwrap(),
-            HurlVar(format!("http://localhost:{port}/export/{key}/{task}")),
+            HurlVar(format!("http://localhost:{port}/export/{key}/{task}/")),
         ),
         (
             HurlVarName::new("hurlin-noise").unwrap(),
-            HurlVar(format!("http://localhost:{port}/noise/{key}/{task}")),
+            HurlVar(format!("http://localhost:{port}/noise/{key}/{task}/")),
         ),
     ];
 
@@ -334,6 +357,94 @@ impl<'a, Ansi: Display> Display for HighlightFile<'a, Ansi> {
     }
 }
 
+fn detect_import_cycle(
+    itree: &mut ImportTree,
+    hostname: &str,
+    last: Utf8PathBuf,
+    fpath: Utf8PathBuf,
+) -> Result<(), StatusCode> {
+    if let Err(cycle) = itree.insert_cydet(last.clone(), fpath.clone()) {
+        eprintln!("\x1b[93;1mcycle detected in import chain:\x1b[0m");
+        eprintln!(
+            "\x1b[37mAttempted to import\x1b[0m {}",
+            Hyperlink::new(
+                format_args!("file://{}{fpath}", hostname),
+                HighlightFile(&fpath, 91)
+            )
+        );
+
+        for (i, path) in cycle.iter().enumerate() {
+            let filelink = format!("file://{}{path}", hostname);
+
+            let link: &dyn Display = if i == (cycle.len() - 1) {
+                &Hyperlink::new(filelink, HighlightFile(&path, 91)) as _
+            } else {
+                &Hyperlink::new(filelink, &path) as _
+            };
+
+            eprintln!("\x1b[37m...which is imported by\x1b[0m {}", link);
+        }
+        Err(StatusCode::FAILED_DEPENDENCY)
+    } else {
+        Ok(())
+    }
+}
+
+async fn run_hurlin_task(
+    fpath: Utf8PathBuf,
+    mut ptree: Vec<Utf8PathBuf>,
+    mut file_owner: OwnedMutexGuard<UnlockedCacheEntry>,
+    state: Arc<HurlinState>,
+) -> Result<Response, StatusCode> {
+    let mut tasks = state.running_tasks.write().await;
+
+    let mut task_id = TaskId::new();
+
+    // ensure no collisions
+    while tasks.contains_key(&task_id) {
+        task_id = TaskId::new();
+    }
+
+    ptree.push(fpath.clone());
+    tasks.insert(task_id, ptree);
+
+    drop(tasks);
+
+    let res = hurlin_spawn(
+        fpath.clone(),
+        [],
+        state.hurl_args.clone(),
+        state.key,
+        state.port,
+        task_id,
+    )
+    .await
+    .unwrap();
+
+    state.running_tasks.write().await.remove(&task_id);
+
+    _ = std::io::stdout().lock().write_all(&res.stdout);
+    _ = std::io::stderr().lock().write_all(&res.stderr);
+
+    if !res.status.success() {
+        eprintln!("Hurl task {task_id} ({fpath}) failed to run to completion");
+        *file_owner = Some(Err(StatusCode::FAILED_DEPENDENCY));
+        return Err(StatusCode::FAILED_DEPENDENCY);
+    } else {
+        if let Some(res) = state.exports.lock().await.remove(&task_id) {
+            let data = file_owner.insert(Ok(Some(res)));
+
+            // unwrap safe as we just inserted
+            let data = data.as_mut().unwrap().as_mut().unwrap();
+
+            return Ok(([(header::CONTENT_TYPE, data.1.clone())], data.0.clone()).into_response());
+        } else {
+            *file_owner = Some(Ok(None));
+            return Ok(().into_response());
+        }
+    }
+}
+
 #[axum::debug_handler]
 async fn imports(
     HurlinRPC(_, task, path): HurlinRPC,
@@ -351,7 +462,7 @@ async fn imports(
     let last = ptree.last().expect("import chain tree cannot be empty");
 
     let Some(dir) = last.parent() else {
-        eprintln!("Somehow,z we were running a directory ({last:?}) and it was the root directory");
+        eprintln!("Somehow, we were running a directory ({last:?}) and it was the root directory");
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     };
 
@@ -365,109 +476,41 @@ async fn imports(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     };
 
-    if let Err(cycle) = state
-        .import_tree
-        .lock()
-        .await
-        .insert_cydet(last.clone(), fpath.clone())
-    {
-        eprintln!("\x1b[93;1mcycle detected in import chain:\x1b[0m");
-        eprintln!(
-            "\x1b[37mAttempted to import\x1b[0m {}",
-            Hyperlink::new(
-                format_args!("file://{}{fpath}", state.hostname),
-                HighlightFile(&fpath, 91)
-            )
-        );
-
-        for (i, path) in cycle.iter().enumerate() {
-            let filelink = format!("file://{}{path}", state.hostname);
-
-            let link: &dyn Display = if i == (cycle.len() - 1) {
-                &Hyperlink::new(filelink, HighlightFile(&path, 91)) as _
-            } else {
-                &Hyperlink::new(filelink, &path) as _
-            };
-
-            eprintln!("\x1b[37m...which is imported by\x1b[0m {}", link);
-        }
-        return Err(StatusCode::FAILED_DEPENDENCY);
-    }
+    detect_import_cycle(
+        &mut *state.import_tree.lock().await,
+        &state.hostname,
+        last.clone(),
+        fpath.clone(),
+    )?;
 
     let mut cache = state.import_cache.lock().await;
 
     let arc = cache.entry(fpath.clone()).or_default().clone();
 
-    let mut file_owner = arc.lock().await;
+    let file_owner = arc.lock_owned().await;
 
     drop(cache);
 
     match &*file_owner {
         // cached with no response body/export
-        Some(Ok(None)) => {
-            return Ok(StatusCode::OK.into_response());
-        }
+        Some(Ok(None)) => Ok(StatusCode::OK.into_response()),
         // cached with a response body
         Some(Ok(Some(TypedBody(data, mime)))) => {
-            return Ok(([(header::CONTENT_TYPE, mime.clone())], data.clone()).into_response());
+            Ok(([(header::CONTENT_TYPE, mime.clone())], data.clone()).into_response())
         }
         // cached failure to run successfully
-        Some(Err(status)) => {
-            return Err(*status);
-        }
+        Some(Err(status)) => Err(*status),
         // no cache
-        None => {
-            let mut tasks = state.running_tasks.write().await;
+        None => run_hurlin_task(fpath, ptree, file_owner, state.clone()).await,
+    }
+}
 
-            let mut task_id = TaskId::new();
-
-            // ensure no collisions
-            while tasks.contains_key(&task_id) {
-                task_id = TaskId::new();
-            }
-
-            ptree.push(fpath.clone());
-            tasks.insert(task_id, ptree);
-
-            drop(tasks);
-
-            let res = hurlin_spawn(
-                fpath,
-                [],
-                state.hurl_args.clone(),
-                state.key,
-                state.port,
-                task_id,
-            )
-            .await
-            .unwrap();
-
-            state.running_tasks.write().await.remove(&task_id);
-
-            _ = std::io::stdout().lock().write_all(&res.stdout);
-            _ = std::io::stderr().lock().write_all(&res.stderr);
-
-            if !res.status.success() {
-                eprintln!("Hurl task {task_id} failed to run to completion");
-                *file_owner = Some(Err(StatusCode::FAILED_DEPENDENCY));
-                return Err(StatusCode::FAILED_DEPENDENCY);
-            } else {
-                if let Some(res) = state.exports.lock().await.remove(&task_id) {
-                    let data = file_owner.insert(Ok(Some(res)));
-
-                    // unwrap safe as we just inserted
-                    let data = data.as_mut().unwrap().as_mut().unwrap();
-
-                    return Ok(
-                        ([(header::CONTENT_TYPE, data.1.clone())], data.0.clone()).into_response()
-                    );
-                } else {
-                    *file_owner = Some(Ok(None));
-                    return Ok(().into_response());
-                }
-            }
-        }
-    };
+#[axum::debug_handler]
+async fn hurlin_async_call(
+    HurlinRPC(_, task, path): HurlinRPC,
+    State(state): State<Arc<HurlinState>>,
+) -> Result<impl IntoResponse, StatusCode> {
+    Ok(())
 }
 
 #[axum::debug_handler]
@@ -557,8 +600,8 @@ async fn main() -> ExitCode {
 
     let app = Router::new()
         .route("/import/:fuzz_key/:taskid/*params", get(imports))
-        .route("/export/:fuzz_key/:taskid", post(exports))
-        .route("/noise/:fuzz_key/:taskid", get(noise))
+        .route("/export/:fuzz_key/:taskid/", post(exports))
+        .route("/noise/:fuzz_key/:taskid/", get(noise))
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
 

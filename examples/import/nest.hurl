@@ -1,4 +1,3 @@
-
 GET {{hurlin-noise}}
 HTTP 200
 [Captures]

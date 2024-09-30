@@ -1,4 +1,4 @@
-GET {{hurlin-import}}./other.hurl
+GET {{hurlin-import}}../import/other.hurl
 HTTP 200
 [Captures]
 json_key: jsonpath "$.foo"
