@@ -383,14 +383,14 @@ fn hurlin_spawn(
 
 fn detect_import_cycle(
     itree: &mut ImportTree,
-    last: Utf8PathBuf,
-    fpath: Utf8PathBuf,
+    parent: FileNameRef,
+    imported: FileNameRef,
 ) -> Result<(), StatusCode> {
-    if let Err(cycle) = itree.insert_cydet(last.clone(), fpath.clone()) {
+    if let Err(cycle) = itree.insert_cydet(parent, imported.clone()) {
         eprintln!("\x1b[93;1mcycle detected in import chain:\x1b[0m");
         eprintln!(
             "\x1b[37mAttempted to import\x1b[0m {}",
-            Hyperlink::from_path_named(&fpath, HighlightFile(&fpath, 91))
+            Hyperlink::from_path_named(&imported, HighlightFile(&imported, 91))
         );
 
         for (i, path) in cycle.iter().enumerate() {
