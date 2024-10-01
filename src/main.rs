@@ -31,7 +31,7 @@ use clap::Parser;
 use indexmap::IndexSet;
 use rand::Rng;
 
-use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tower_http::trace::TraceLayer;
 
 mod ansi;
@@ -116,19 +116,22 @@ impl TaskId {
 #[derive(Clone)]
 struct TypedBody(Bytes, String);
 
-type CacheEntry = Option<Result<Option<TypedBody>, StatusCode>>;
-type Locked<T> = Arc<Mutex<T>>;
+// TODO all of this should have proper newtypes instead of this catastrophe
+type CacheEntry = Result<Option<TypedBody>, StatusCode>;
+type ShareLock<T> = Arc<Mutex<T>>;
+
+type HandleMap<K, V> = Mutex<HashMap<K, ShareLock<Option<V>>>>;
 
 struct HurlinState {
     key: HurlinKey,
     port: u16,
     hurl_args: Arc<[String]>,
     hurl_calls: AtomicU64,
-    import_cache: Mutex<HashMap<Utf8PathBuf, Locked<CacheEntry>>>,
+    import_cache: HandleMap<Utf8PathBuf, CacheEntry>,
     import_tree: Mutex<ImportTree>,
-    running_tasks: RwLock<HashMap<TaskId, Vec<Utf8PathBuf>>>,
+    running_tasks: Mutex<HashMap<TaskId, Vec<Utf8PathBuf>>>,
     exports: Mutex<HashMap<TaskId, TypedBody>>,
-    async_waits: Mutex<HashMap<(AsyncKey, TaskId), Locked<Option<Response>>>>,
+    async_waits: HandleMap<(AsyncKey, TaskId), Response>,
 }
 
 impl HurlinState {
@@ -167,16 +170,14 @@ impl HurlinState {
         (key, async_key_data)
     }
 
-    async fn cache_entry_for(&self, file: FileNameRef) -> OwnedMutexGuard<CacheEntry> {
+    async fn cache_entry_for(&self, file: FileNameRef) -> OwnedMutexGuard<Option<CacheEntry>> {
         let mut cache = self.import_cache.lock().await;
 
         let arc = cache.entry(file).or_default().clone();
 
         drop(cache);
 
-        let file_owner = arc.lock_owned().await;
-
-        file_owner
+        arc.lock_owned().await
     }
 }
 
@@ -196,7 +197,7 @@ impl HurlVarName {
 
         let bytes = s.as_bytes();
 
-        let Some(first) = bytes.get(0) else {
+        let Some(first) = bytes.first() else {
             return Err(s);
         };
 
@@ -246,7 +247,7 @@ impl axum::extract::FromRequestParts<Arc<HurlinState>> for HurlinRPC {
             return Err(StatusCode::FORBIDDEN);
         }
 
-        if !state.running_tasks.read().await.contains_key(&rpc.0) {
+        if !state.running_tasks.lock().await.contains_key(&rpc.0) {
             tracing::error!("Request sent with invalid TaskId");
             return Err(StatusCode::BAD_REQUEST);
         };
@@ -312,7 +313,7 @@ fn hurl_call(
     arguments: Arc<[String]>,
 ) -> impl Future<Output = Result<std::process::Output, io::Error>> {
     let mut p = tokio::process::Command::new("hurl");
-    p.args(arguments.into_iter());
+    p.args(arguments.iter());
     p.arg("--color");
 
     for var in variables {
@@ -359,7 +360,7 @@ fn hurlin_spawn(
         ),
     ];
 
-    return hurl_call(file, variables.into_iter().chain(vars), args);
+    hurl_call(file, variables.into_iter().chain(vars), args)
 }
 
 fn detect_import_cycle(
@@ -376,7 +377,7 @@ fn detect_import_cycle(
 
         for (i, path) in cycle.iter().enumerate() {
             let link: &dyn Display = if i == (cycle.len() - 1) {
-                &Hyperlink::from_path_named(path, HighlightFile(&path, 91)) as _
+                &Hyperlink::from_path_named(path, HighlightFile(path, 91)) as _
             } else {
                 &Hyperlink::from_path(path) as _
             };
@@ -392,10 +393,10 @@ fn detect_import_cycle(
 async fn run_hurlin_task(
     file_path: FileNameRef,
     mut call_stack: Vec<FileNameRef>,
-    cache: Option<OwnedMutexGuard<CacheEntry>>,
+    cache: Option<OwnedMutexGuard<Option<CacheEntry>>>,
     state: Arc<HurlinState>,
 ) -> Result<Response, StatusCode> {
-    let mut tasks = state.running_tasks.write().await;
+    let mut tasks = state.running_tasks.lock().await;
 
     let mut task_id = TaskId::new();
 
@@ -413,7 +414,7 @@ async fn run_hurlin_task(
         .await
         .unwrap();
 
-    state.running_tasks.write().await.remove(&task_id);
+    state.running_tasks.lock().await.remove(&task_id);
 
     _ = std::io::stdout().lock().write_all(&res.stdout);
     _ = std::io::stderr().lock().write_all(&res.stderr);
@@ -423,21 +424,20 @@ async fn run_hurlin_task(
         if let Some(mut cache_this) = cache {
             *cache_this = Some(Err(StatusCode::FAILED_DEPENDENCY));
         }
-        return Err(StatusCode::FAILED_DEPENDENCY);
-    } else {
-        if let Some(data) = state.exports.lock().await.remove(&task_id) {
-            if let Some(mut cache_this) = cache {
-                *cache_this = Some(Ok(Some(data.clone())));
-            }
 
-            return Ok(([(header::CONTENT_TYPE, data.1)], data.0).into_response());
-        } else {
-            if let Some(mut cache_this) = cache {
-                *cache_this = Some(Ok(None));
-            }
-
-            return Ok(().into_response());
+        Err(StatusCode::FAILED_DEPENDENCY)
+    } else if let Some(data) = state.exports.lock().await.remove(&task_id) {
+        if let Some(mut cache_this) = cache {
+            *cache_this = Some(Ok(Some(data.clone())));
         }
+
+        Ok(([(header::CONTENT_TYPE, data.1)], data.0).into_response())
+    } else {
+        if let Some(mut cache_this) = cache {
+            *cache_this = Some(Ok(None));
+        }
+
+        Ok(().into_response())
     }
 }
 
@@ -446,7 +446,7 @@ async fn run_cacheable_hurlin_task(
     file_path: FileNameRef,
     call_stack: Vec<FileNameRef>,
     cache_args: HurlinImportArgs,
-    file_owner: OwnedMutexGuard<CacheEntry>,
+    file_owner: OwnedMutexGuard<Option<CacheEntry>>,
 ) -> Result<Response, StatusCode> {
     if cache_args.rerun() {
         // drop early if not needed
@@ -487,7 +487,7 @@ async fn callstack_info(
     state: &HurlinState,
     request: Option<String>,
 ) -> Result<CallstackInfo, StatusCode> {
-    let rlock = state.running_tasks.read().await;
+    let rlock = state.running_tasks.lock().await;
 
     let Some(ptree) = rlock.get(&task_id) else {
         return Err(StatusCode::UNAUTHORIZED);
@@ -508,7 +508,7 @@ async fn callstack_info(
 
     let mut dir = dir.to_path_buf();
 
-    let params = Utf8PathBuf::from(request.unwrap_or(String::new()));
+    let params = Utf8PathBuf::from(request.unwrap_or_default());
     dir.push(params);
 
     let Ok(fpath) = dir.canonicalize_utf8() else {
@@ -598,14 +598,13 @@ async fn hurlin_await(
         return Err(StatusCode::BAD_REQUEST);
     };
 
-    match state.async_waits.lock().await.remove(&(key, task)) {
-        Some(waitable) => Ok(waitable.lock().await.take().unwrap()),
-        None => {
-            eprintln!(
-                "AsyncKey did not exist in wait stack, perhaps something else already claimed it?"
-            );
-            Err(StatusCode::BAD_REQUEST)
-        }
+    if let Some(waitable) = state.async_waits.lock().await.remove(&(key, task)) {
+        Ok(waitable.lock().await.take().unwrap())
+    } else {
+        eprintln!(
+            "AsyncKey did not exist in wait stack, perhaps something else already claimed it?"
+        );
+        Err(StatusCode::BAD_REQUEST)
     }
 }
 
@@ -639,7 +638,7 @@ async fn exports(
 }
 
 async fn noise(_: HurlinRPC) -> impl IntoResponse {
-    let data = hex::encode(&rand::thread_rng().gen::<[u8; 8]>());
+    let data = hex::encode(rand::thread_rng().gen::<[u8; 8]>());
 
     (
         [(CONTENT_TYPE, "application/json")],
@@ -703,7 +702,7 @@ async fn main() -> ExitCode {
 
     state
         .running_tasks
-        .write()
+        .lock()
         .await
         .insert(root, vec![root_f.clone()]);
 
