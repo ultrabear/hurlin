@@ -88,60 +88,8 @@ impl ImportTree {
     }
 }
 
-#[derive(Eq, Hash, PartialEq, Copy, Clone)]
-struct HexKey([u8; 16]);
-
-impl HexKey {
-    fn as_str(&self) -> &str {
-        core::str::from_utf8(&self.0).unwrap()
-    }
-
-    fn validate(data: &str) -> Result<Self, ()> {
-        let Ok(bytes) = <[u8; 16]>::try_from(data.as_bytes()) else {
-            return Err(());
-        };
-
-        if bytes.iter().all(|b| b.is_ascii_hexdigit()) {
-            return Ok(Self(bytes));
-        } else {
-            return Err(());
-        }
-    }
-
-    /// generates a new random taskid
-    fn new() -> Self {
-        let data: [u8; 8] = rand::thread_rng().gen();
-
-        Self(hex::encode(&data).as_bytes().try_into().unwrap())
-    }
-}
-
-macro_rules! basically_hexkey {
-    ($type:ident) => {
-        #[derive(Eq, Hash, PartialEq, Copy, Clone)]
-        struct $type(HexKey);
-
-        impl $type {
-            fn as_str(&self) -> &str {
-                self.0.as_str()
-            }
-
-            fn validate(data: &str) -> Result<Self, ()> {
-                HexKey::validate(data).map(Self)
-            }
-
-            fn new() -> Self {
-                Self(HexKey::new())
-            }
-        }
-
-        impl fmt::Display for $type {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "{}", self.as_str())
-            }
-        }
-    };
-}
+mod hexkey;
+use hexkey::basically_hexkey;
 
 basically_hexkey!(HurlinKey);
 basically_hexkey!(TaskId);
@@ -196,6 +144,39 @@ impl HurlinState {
             exports: Default::default(),
             async_waits: Default::default(),
         }
+    }
+
+    async fn get_unique_async_key(
+        &self,
+        task: TaskId,
+    ) -> (AsyncKey, OwnedMutexGuard<Option<Response>>) {
+        let mut async_map = self.async_waits.lock().await;
+
+        let mut key = AsyncKey::new();
+
+        while async_map.contains_key(&(key, task)) {
+            key = AsyncKey::new();
+        }
+
+        let arc = async_map.entry((key, task)).or_default().clone();
+
+        drop(async_map);
+
+        let async_key_data = arc.lock_owned().await;
+
+        (key, async_key_data)
+    }
+
+    async fn cache_entry_for(&self, file: FileNameRef) -> OwnedMutexGuard<CacheEntry> {
+        let mut cache = self.import_cache.lock().await;
+
+        let arc = cache.entry(file).or_default().clone();
+
+        drop(cache);
+
+        let file_owner = arc.lock_owned().await;
+
+        file_owner
     }
 }
 
@@ -562,13 +543,8 @@ async fn imports(
         task_name.clone(),
         imports.clone(),
     )?;
-    let mut cache = state.import_cache.lock().await;
 
-    let arc = cache.entry(imports.clone()).or_default().clone();
-
-    let file_owner = arc.lock_owned().await;
-
-    drop(cache);
+    let file_owner = state.cache_entry_for(imports.clone()).await;
 
     run_cacheable_hurlin_task(state, imports, call_stack, cache_args, file_owner).await
 }
@@ -591,27 +567,9 @@ async fn hurlin_async_call(
         imports.clone(),
     )?;
 
-    let mut async_map = state.async_waits.lock().await;
+    let (key, mut async_key_data) = state.get_unique_async_key(task).await;
 
-    let mut key = AsyncKey::new();
-
-    while async_map.contains_key(&(key, task)) {
-        key = AsyncKey::new();
-    }
-
-    let arc = async_map.entry((key, task)).or_default().clone();
-
-    let mut async_key_data = arc.lock_owned().await;
-
-    drop(async_map);
-
-    let mut cache = state.import_cache.lock().await;
-
-    let arc = cache.entry(imports.clone()).or_default().clone();
-
-    let file_owner = arc.lock_owned().await;
-
-    drop(cache);
+    let file_owner = state.cache_entry_for(imports.clone()).await;
 
     tokio::spawn(async move {
         let res =
@@ -620,13 +578,12 @@ async fn hurlin_async_call(
         *async_key_data = Some(res.into_response());
     });
 
-    let r_data = typed_json::json!({
-        "await": key.to_string(),
-    });
-
     Ok((
         [(CONTENT_TYPE, "application/json")],
-        serde_json::to_string(&r_data).expect("this is always valid json"),
+        serde_json::to_string(&typed_json::json!({
+            "await": key.to_string()
+        }))
+        .expect("this is always valid json"),
     )
         .into_response())
 }
@@ -684,13 +641,12 @@ async fn exports(
 async fn noise(_: HurlinRPC) -> impl IntoResponse {
     let data = hex::encode(&rand::thread_rng().gen::<[u8; 8]>());
 
-    let r_data = typed_json::json!({
-        "noise": data,
-    });
-
     (
         [(CONTENT_TYPE, "application/json")],
-        serde_json::to_string(&r_data).expect("this is always valid json"),
+        serde_json::to_string(&typed_json::json!({
+            "noise": data,
+        }))
+        .expect("this is always valid json"),
     )
 }
 
