@@ -12,6 +12,7 @@ use std::{
     },
 };
 
+
 use axum::{
     async_trait,
     body::Bytes,
@@ -127,9 +128,10 @@ struct HurlinState {
     port: u16,
     hurl_args: Arc<[String]>,
     hurl_calls: AtomicU64,
-    import_cache: HandleMap<Utf8PathBuf, CacheEntry>,
+    intern: lasso::ThreadedRodeo,
+    import_cache: HandleMap<FileNameRef, CacheEntry>,
     import_tree: Mutex<ImportTree>,
-    running_tasks: Mutex<HashMap<TaskId, Vec<Utf8PathBuf>>>,
+    running_tasks: Mutex<HashMap<TaskId, Vec<FileNameRef>>>,
     exports: Mutex<HashMap<TaskId, TypedBody>>,
     async_waits: HandleMap<(AsyncKey, TaskId), Response>,
 }
@@ -141,6 +143,7 @@ impl HurlinState {
             port,
             hurl_args,
             hurl_calls: AtomicU64::new(0),
+            intern: Default::default(),
             import_cache: Default::default(),
             import_tree: Default::default(),
             running_tasks: Default::default(),
@@ -425,6 +428,9 @@ async fn run_hurlin_task(
             *cache_this = Some(Err(StatusCode::FAILED_DEPENDENCY));
         }
 
+        // its possible that an export was successful, but we consume that if the hurl task failed
+        _ = state.exports.lock().await.remove(&task_id);
+
         Err(StatusCode::FAILED_DEPENDENCY)
     } else if let Some(data) = state.exports.lock().await.remove(&task_id) {
         if let Some(mut cache_this) = cache {
@@ -544,6 +550,7 @@ async fn imports(
         imports.clone(),
     )?;
 
+    // TODO do not open cache for nocache items or nocache tasks will wait on recache/normal tasks
     let file_owner = state.cache_entry_for(imports.clone()).await;
 
     run_cacheable_hurlin_task(state, imports, call_stack, cache_args, file_owner).await
