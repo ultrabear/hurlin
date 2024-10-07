@@ -28,6 +28,7 @@ use axum::{
 };
 
 use camino::{Utf8Path, Utf8PathBuf};
+use cap_std::{ambient_authority, fs_utf8, AmbientAuthority};
 use clap::Parser;
 use lasso::Spur;
 use rand::Rng;
@@ -117,6 +118,7 @@ struct HurlinState {
     hurl_args: Arc<[String]>,
     hurl_calls: AtomicU64,
     intern: lasso::ThreadedRodeo,
+    cap_dir: PathDir,
 
     // task management
     import_cache: HandleMap<FileNameRef, CacheEntry>,
@@ -127,11 +129,12 @@ struct HurlinState {
 }
 
 impl HurlinState {
-    fn new(key: HurlinKey, port: u16, hurl_args: Arc<[String]>) -> Self {
+    fn new(key: HurlinKey, port: u16, hurl_args: Arc<[String]>, cap_dir: PathDir) -> Self {
         Self {
             key,
             port,
             hurl_args,
+            cap_dir,
             hurl_calls: AtomicU64::new(0),
             intern: Default::default(),
             import_cache: Default::default(),
@@ -318,6 +321,7 @@ fn hurl_call(
 
 fn hurlin_spawn(
     file: Utf8PathBuf,
+    base_dir: Utf8PathBuf,
     variables: impl IntoIterator<Item = (HurlVarName, HurlVar)>,
     state: Arc<HurlinState>,
     task: TaskId,
@@ -328,14 +332,20 @@ fn hurlin_spawn(
 
     state.hurl_calls.fetch_add(1, atomic::Ordering::Relaxed);
 
+    let base_dir = if base_dir == "" { String::new() } else { format!("{base_dir}/") };
+
     let vars = [
         (
             HurlVarName::new("hurlin-import").unwrap(),
-            HurlVar(format!("http://localhost:{port}/import/{key}/{task}/")),
+            HurlVar(format!(
+                "http://localhost:{port}/import/{key}/{task}/{base_dir}"
+            )),
         ),
         (
             HurlVarName::new("hurlin-async").unwrap(),
-            HurlVar(format!("http://localhost:{port}/async/{key}/{task}/")),
+            HurlVar(format!(
+                "http://localhost:{port}/async/{key}/{task}/{base_dir}"
+            )),
         ),
         (
             HurlVarName::new("hurlin-await").unwrap(),
@@ -356,6 +366,7 @@ fn hurlin_spawn(
 
 fn detect_import_cycle(
     itree: &mut AcyclicTree<FileNameRef>,
+    cap_dir: &PathDir,
     parent: FileNameRef,
     imported: FileNameRef,
     intern: &lasso::ThreadedRodeo,
@@ -366,19 +377,19 @@ fn detect_import_cycle(
             ScopeColor::new("93;1", "cycle detected in import chain:")
         );
 
-        let imported = intern.resolve(&imported);
+        let imported = cap_dir.to_root(<&Utf8Path>::from(intern.resolve(&imported)));
 
         tracing::error!(
             "{} {}",
             ScopeColor::new("37", "Attempted to import"),
-            Hyperlink::from_path_named(imported, HighlightFile(<&Utf8Path>::from(imported), 91))
+            Hyperlink::from_path_named(&imported, HighlightFile(&imported, 91))
         );
 
         for (i, path) in cycle.iter().enumerate() {
-            let path = intern.resolve(path);
+            let path = cap_dir.to_root(<&Utf8Path>::from(intern.resolve(path)));
 
             let link: &dyn Display = if i == (cycle.len() - 1) {
-                &Hyperlink::from_path_named(path, HighlightFile(<&Utf8Path>::from(path), 91)) as _
+                &Hyperlink::from_path_named(&path, HighlightFile(&path, 91)) as _
             } else {
                 &Hyperlink::from_path(path) as _
             };
@@ -417,9 +428,15 @@ async fn run_hurlin_task(
 
     let fpath = Utf8PathBuf::from(state.intern.resolve(&file_path));
 
-    let res = hurlin_spawn(fpath.clone(), [], state.clone(), task_id)
-        .await
-        .unwrap();
+    let res = hurlin_spawn(
+        state.cap_dir.to_root(&fpath),
+        fpath.parent().expect("please").to_owned(),
+        [],
+        state.clone(),
+        task_id,
+    )
+    .await
+    .unwrap();
 
     state.running_tasks.lock().await.remove(&task_id);
 
@@ -427,7 +444,10 @@ async fn run_hurlin_task(
     _ = std::io::stderr().lock().write_all(&res.stderr);
 
     if !res.status.success() {
-        tracing::error!("Hurl task {task_id} ({fpath}) failed to run to completion");
+        tracing::error!(
+            "Hurl task {task_id} ({}) failed to run to completion",
+            state.cap_dir.to_root(&fpath)
+        );
         if let Some(mut cache_this) = cache {
             *cache_this = Some(Err(StatusCode::FAILED_DEPENDENCY));
         }
@@ -502,25 +522,12 @@ async fn callstack_info(
 
     let last = *ptree.last().expect("import chain tree cannot be empty");
 
-    let resolved_last = state.intern.resolve(&last);
-
-    let Some(dir) = <&Utf8Path>::from(resolved_last).parent() else {
-        tracing::error!(
-            "Somehow, we were running a directory ({last:?}) and it was the root directory"
-        );
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    };
-
-    let mut dir = dir.to_path_buf();
-
     let params = Utf8PathBuf::from(request.unwrap_or_default());
 
-    dir.push(params);
-
-    let Ok(fpath) = dir.canonicalize_utf8() else {
+    let Ok(fpath) = state.cap_dir.dir.canonicalize(&params) else {
         tracing::error!(
-            "Failed to canonicalize path: {}, its possible it doesn't exist",
-            Hyperlink::from_path(dir)
+                "Failed to canonicalize path: {}, it either doesn't exist or exists outside of the cap directory",
+            Hyperlink::from_path(state.cap_dir.to_root(&params))
         );
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     };
@@ -548,6 +555,7 @@ async fn imports(
 
     detect_import_cycle(
         &mut *state.import_tree.lock().await,
+        &state.cap_dir,
         task_name,
         imports,
         &state.intern,
@@ -575,6 +583,7 @@ async fn hurlin_async_call(
 
     detect_import_cycle(
         &mut *state.import_tree.lock().await,
+        &state.cap_dir,
         task_name,
         imports,
         &state.intern,
@@ -670,12 +679,94 @@ async fn noise(_: HurlinRPC) -> impl IntoResponse {
 /// MVP: a bolt on hurl wrapper with enhanced functionality
 #[clap(version)]
 struct Args {
-    /// file to treat as the root node
+    /// File to treat as the root task
     file: Utf8PathBuf,
+
+    /// Directory to cap imports to;
+    ///   imports cannot traverse to parents of this directory.
+    ///
+    /// By default a git repository is searched for
+    ///   to use as the cap dir (via parent traversal from cwd),
+    ///   if not found the executed file's directory is used.
+    #[clap(long, verbatim_doc_comment)]
+    cap_dir: Option<Utf8PathBuf>,
 
     /// Arguments to forward to hurl verbatim
     #[clap(last = true)]
     hurl: Vec<String>,
+}
+
+struct PathDir {
+    dir: fs_utf8::Dir,
+    path: Utf8PathBuf,
+}
+
+impl PathDir {
+    fn parse_base_dir(
+        root_file: &Utf8Path,
+        cap_dir: Option<Utf8PathBuf>,
+        authority: AmbientAuthority,
+    ) -> io::Result<Self> {
+        match cap_dir {
+            Some(cap_to) => {
+                let cap_to = cap_to.canonicalize_utf8()?;
+
+                Ok(PathDir {
+                    dir: fs_utf8::Dir::open_ambient_dir(&cap_to, authority)?,
+                    path: cap_to,
+                })
+            }
+            None => {
+                let cwd = Utf8PathBuf::try_from(std::env::current_dir()?)
+                    .map_err(|e| e.into_io_error())?;
+
+                let mut tmp = Utf8PathBuf::new();
+
+                for dir in cwd.ancestors() {
+                    tmp.clear();
+                    dir.clone_into(&mut tmp);
+                    tmp.push(".git");
+
+                    if tmp.try_exists().unwrap_or(false) {
+                        return Ok(PathDir {
+                            dir: fs_utf8::Dir::open_ambient_dir(&dir, authority)?,
+                            path: dir.to_owned(),
+                        });
+                    }
+                }
+
+                if let Some(dir) = root_file.parent() {
+                    return Ok(PathDir {
+                        dir: fs_utf8::Dir::open_ambient_dir(&dir, authority)?,
+                        path: dir.to_owned(),
+                    });
+                } else {
+                    return Err(io::Error::other(
+                        "root hurlin file passed was `/` or otherwise parentless",
+                    ));
+                }
+            }
+        }
+    }
+
+    fn from_root(&self, path: &Utf8Path) -> io::Result<Utf8PathBuf> {
+        let canon = path.canonicalize_utf8()?;
+
+        let path = match canon.strip_prefix(&self.path) {
+            Err(_) => {
+                return Err(io::Error::other(
+                    "path does not exist within capped directory",
+                ))
+            }
+            Ok(path) => path,
+        };
+
+        self.dir.canonicalize(path)
+    }
+
+    fn to_root(&self, canon_path: &Utf8Path) -> Utf8PathBuf {
+        self.path.join(canon_path)
+    }
 }
 
 #[tokio::main]
@@ -684,11 +775,22 @@ async fn main() -> ExitCode {
 
     let args = Args::parse();
 
+    let dir = match PathDir::parse_base_dir(&args.file, args.cap_dir, ambient_authority()) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!("Failed to get base working dir: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let hurl_args = Arc::from_iter(args.hurl);
 
-    let Ok(root_f) = args.file.canonicalize_utf8() else {
-        tracing::error!("Failed to cannonicalize input file, init failure");
-        return ExitCode::FAILURE;
+    let root_f = match dir.from_root(&args.file) {
+        Err(e) => {
+            tracing::error!("Failed to cannonicalize input file {:?}: {e}", args.file);
+            return ExitCode::FAILURE;
+        }
+        Ok(f) => f,
     };
 
     let fuzz_key = HurlinKey::new();
@@ -699,7 +801,7 @@ async fn main() -> ExitCode {
 
     let port = addr.local_addr().unwrap().port();
 
-    let state = Arc::new(HurlinState::new(fuzz_key, port, hurl_args.clone()));
+    let state = Arc::new(HurlinState::new(fuzz_key, port, hurl_args.clone(), dir));
 
     let app = Router::new()
         .route("/import/:fuzz_key/:taskid/*params", get(imports))
@@ -725,7 +827,15 @@ async fn main() -> ExitCode {
         .await
         .insert(root, vec![root_f_key]);
 
-    let res = hurlin_spawn(root_f, [], state.clone(), root).await.unwrap();
+    let res = hurlin_spawn(
+        state.cap_dir.to_root(&root_f),
+        root_f.parent().expect("yea").to_owned(),
+        [],
+        state.clone(),
+        root,
+    )
+    .await
+    .unwrap();
 
     _ = std::io::stdout().lock().write_all(&res.stdout);
     _ = std::io::stderr().lock().write_all(&res.stderr);
