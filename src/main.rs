@@ -3,6 +3,7 @@ use std::{
     collections::HashMap,
     fmt::Display,
     future::{Future, IntoFuture},
+    hash::Hash,
     io::{self, Write},
     net::Ipv4Addr,
     process::{self, ExitCode},
@@ -11,7 +12,6 @@ use std::{
         Arc,
     },
 };
-
 
 use axum::{
     async_trait,
@@ -27,37 +27,27 @@ use axum::{
     RequestPartsExt, Router,
 };
 
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use clap::Parser;
-use indexmap::IndexSet;
+use lasso::Spur;
 use rand::Rng;
 
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tower_http::trace::TraceLayer;
 
 mod ansi;
-use ansi::{HighlightFile, Hyperlink};
+use ansi::{HighlightFile, Hyperlink, ScopeColor};
 
-type InternKey = usize;
-// make it easier to intern later lolol
-type FileNameRef = Utf8PathBuf;
+type FileNameRef = Spur;
 
 #[derive(Debug, Default)]
-struct ImportTree {
-    intern: IndexSet<Utf8PathBuf>,
-    imports: HashMap<InternKey, Vec<InternKey>>,
-    imported: HashMap<InternKey, Vec<InternKey>>,
+struct ImportTree<Ident> {
+    imports: HashMap<Ident, Vec<Ident>>,
+    imported: HashMap<Ident, Vec<Ident>>,
 }
 
-impl ImportTree {
-    fn insert_cydet(
-        &mut self,
-        root: Utf8PathBuf,
-        imports: Utf8PathBuf,
-    ) -> Result<(), Vec<Utf8PathBuf>> {
-        let root = self.intern.insert_full(root).0;
-        let imports = self.intern.insert_full(imports).0;
-
+impl<Ident: Eq + Hash + Copy> ImportTree<Ident> {
+    fn insert_cydet(&mut self, root: Ident, imports: Ident) -> Result<(), Vec<Ident>> {
         let goal = imports;
 
         let mut stack = vec![vec![root]];
@@ -66,10 +56,7 @@ impl ImportTree {
             let last = n.last().unwrap();
 
             if *last == goal {
-                return Err(n
-                    .into_iter()
-                    .map(|v| self.intern.get_index(v).unwrap().clone())
-                    .collect());
+                return Err(n.into_iter().collect());
             }
 
             if let Some(used) = self.imported.get(last) {
@@ -114,7 +101,7 @@ impl TaskId {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct TypedBody(Bytes, String);
 
 // TODO all of this should have proper newtypes instead of this catastrophe
@@ -124,13 +111,16 @@ type ShareLock<T> = Arc<Mutex<T>>;
 type HandleMap<K, V> = Mutex<HashMap<K, ShareLock<Option<V>>>>;
 
 struct HurlinState {
+    // hurlin state
     key: HurlinKey,
     port: u16,
     hurl_args: Arc<[String]>,
     hurl_calls: AtomicU64,
     intern: lasso::ThreadedRodeo,
+
+    // task management
     import_cache: HandleMap<FileNameRef, CacheEntry>,
-    import_tree: Mutex<ImportTree>,
+    import_tree: Mutex<ImportTree<FileNameRef>>,
     running_tasks: Mutex<HashMap<TaskId, Vec<FileNameRef>>>,
     exports: Mutex<HashMap<TaskId, TypedBody>>,
     async_waits: HandleMap<(AsyncKey, TaskId), Response>,
@@ -265,29 +255,21 @@ enum HurlinImportArgs {
     /// setting the cache after
     #[default]
     Normal,
-    /// always run and insert new value into cache, may contribute to
-    /// races in hurlin files, beware!
-    Recache,
     /// always run and do not interact with cache at all
     Nocache,
 }
 
-impl HurlinImportArgs {
-    /// whether behaviour should be to always rerun
-    fn rerun(&self) -> bool {
-        matches!(self, Self::Recache | Self::Nocache)
-    }
-
-    /// whether the run should be cached
-    fn cache_run(&self) -> bool {
-        matches!(self, Self::Normal | Self::Recache)
-    }
+#[derive(Debug)]
+enum HurlinCacheType {
+    Normal(OwnedMutexGuard<Option<CacheEntry>>),
+    Nocache,
 }
 
 #[derive(serde_derive::Deserialize)]
 struct HurlinImportQuery {
-    recache: Option<String>,
     nocache: Option<String>,
+    #[serde(flatten)]
+    rest: HashMap<String, String>,
 }
 
 #[async_trait]
@@ -296,14 +278,20 @@ impl<S> axum::extract::FromRequestParts<S> for HurlinImportArgs {
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         let Ok(Query(query)) = parts.extract::<Query<HurlinImportQuery>>().await else {
-            eprintln!("Failed to validate HurlinImportQuery parameters");
+            tracing::error!("Failed to validate HurlinImport parameters");
             return Err(StatusCode::BAD_REQUEST);
         };
 
+        if !query.rest.is_empty() {
+            tracing::error!(
+                "Extra unknown parameters passed to HurlinImport: {:?}",
+                query.rest.keys().collect::<Vec<_>>()
+            );
+            return Err(StatusCode::BAD_REQUEST);
+        }
+
         Ok(if query.nocache.is_some() {
             Self::Nocache
-        } else if query.recache.is_some() {
-            Self::Recache
         } else {
             Self::Normal
         })
@@ -367,25 +355,39 @@ fn hurlin_spawn(
 }
 
 fn detect_import_cycle(
-    itree: &mut ImportTree,
+    itree: &mut ImportTree<FileNameRef>,
     parent: FileNameRef,
     imported: FileNameRef,
+    intern: &lasso::ThreadedRodeo,
 ) -> Result<(), StatusCode> {
-    if let Err(cycle) = itree.insert_cydet(parent, imported.clone()) {
-        eprintln!("\x1b[93;1mcycle detected in import chain:\x1b[0m");
-        eprintln!(
-            "\x1b[37mAttempted to import\x1b[0m {}",
-            Hyperlink::from_path_named(&imported, HighlightFile(&imported, 91))
+    if let Err(cycle) = itree.insert_cydet(parent, imported) {
+        tracing::error!(
+            "{}",
+            ScopeColor::new("93;1", "cycle detected in import chain:")
+        );
+
+        let imported = intern.resolve(&imported);
+
+        tracing::error!(
+            "{} {}",
+            ScopeColor::new("37", "Attempted to import"),
+            Hyperlink::from_path_named(imported, HighlightFile(<&Utf8Path>::from(imported), 91))
         );
 
         for (i, path) in cycle.iter().enumerate() {
+            let path = intern.resolve(path);
+
             let link: &dyn Display = if i == (cycle.len() - 1) {
-                &Hyperlink::from_path_named(path, HighlightFile(path, 91)) as _
+                &Hyperlink::from_path_named(path, HighlightFile(<&Utf8Path>::from(path), 91)) as _
             } else {
                 &Hyperlink::from_path(path) as _
             };
 
-            eprintln!("\x1b[37m...which is imported by\x1b[0m {}", link);
+            tracing::error!(
+                "{} {}",
+                ScopeColor::new("37", "...which is imported by"),
+                link
+            );
         }
         Err(StatusCode::FAILED_DEPENDENCY)
     } else {
@@ -408,12 +410,14 @@ async fn run_hurlin_task(
         task_id = TaskId::new();
     }
 
-    call_stack.push(file_path.clone());
+    call_stack.push(file_path);
     tasks.insert(task_id, call_stack);
 
     drop(tasks);
 
-    let res = hurlin_spawn(file_path.clone(), [], state.clone(), task_id)
+    let fpath = Utf8PathBuf::from(state.intern.resolve(&file_path));
+
+    let res = hurlin_spawn(fpath.clone(), [], state.clone(), task_id)
         .await
         .unwrap();
 
@@ -423,7 +427,7 @@ async fn run_hurlin_task(
     _ = std::io::stderr().lock().write_all(&res.stderr);
 
     if !res.status.success() {
-        eprintln!("Hurl task {task_id} ({file_path}) failed to run to completion");
+        tracing::error!("Hurl task {task_id} ({fpath}) failed to run to completion");
         if let Some(mut cache_this) = cache {
             *cache_this = Some(Err(StatusCode::FAILED_DEPENDENCY));
         }
@@ -451,32 +455,26 @@ async fn run_cacheable_hurlin_task(
     state: Arc<HurlinState>,
     file_path: FileNameRef,
     call_stack: Vec<FileNameRef>,
-    cache_args: HurlinImportArgs,
-    file_owner: OwnedMutexGuard<Option<CacheEntry>>,
+    cache_args: HurlinCacheType,
 ) -> Result<Response, StatusCode> {
-    if cache_args.rerun() {
-        // drop early if not needed
-        let file_owner = cache_args.cache_run().then_some(file_owner);
-        run_hurlin_task(file_path, call_stack, file_owner, state.clone()).await
-    } else {
-        match &*file_owner {
-            // cached with no response body/export
-            Some(Ok(None)) => Ok(StatusCode::OK.into_response()),
-            // cached with a response body
-            Some(Ok(Some(TypedBody(data, mime)))) => {
-                Ok(([(header::CONTENT_TYPE, mime.clone())], data.clone()).into_response())
-            }
-            // cached failure to run successfully
-            Some(Err(status)) => Err(*status),
-            // not cached
-            None => {
-                run_hurlin_task(
-                    file_path,
-                    call_stack,
-                    cache_args.cache_run().then_some(file_owner),
-                    state.clone(),
-                )
-                .await
+    match cache_args {
+        HurlinCacheType::Nocache => {
+            run_hurlin_task(file_path, call_stack, None, state.clone()).await
+        }
+        HurlinCacheType::Normal(file_owner) => {
+            match &*file_owner {
+                // cached with no response body/export
+                Some(Ok(None)) => Ok(StatusCode::OK.into_response()),
+                // cached with a response body
+                Some(Ok(Some(TypedBody(data, mime)))) => {
+                    Ok(([(header::CONTENT_TYPE, mime.clone())], data.clone()).into_response())
+                }
+                // cached failure to run successfully
+                Some(Err(status)) => Err(*status),
+                // not cached
+                None => {
+                    run_hurlin_task(file_path, call_stack, Some(file_owner), state.clone()).await
+                }
             }
         }
     }
@@ -502,28 +500,32 @@ async fn callstack_info(
     let ptree = ptree.clone();
     drop(rlock);
 
-    let last = ptree
-        .last()
-        .expect("import chain tree cannot be empty")
-        .clone();
+    let last = *ptree.last().expect("import chain tree cannot be empty");
 
-    let Some(dir) = last.parent() else {
-        eprintln!("Somehow, we were running a directory ({last:?}) and it was the root directory");
+    let resolved_last = state.intern.resolve(&last);
+
+    let Some(dir) = <&Utf8Path>::from(resolved_last).parent() else {
+        tracing::error!(
+            "Somehow, we were running a directory ({last:?}) and it was the root directory"
+        );
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     };
 
     let mut dir = dir.to_path_buf();
 
     let params = Utf8PathBuf::from(request.unwrap_or_default());
+
     dir.push(params);
 
     let Ok(fpath) = dir.canonicalize_utf8() else {
-        eprintln!(
+        tracing::error!(
             "Failed to canonicalize path: {}, its possible it doesn't exist",
             Hyperlink::from_path(dir)
         );
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     };
+
+    let fpath = state.intern.get_or_intern(fpath);
 
     Ok(CallstackInfo {
         call_stack: ptree,
@@ -546,14 +548,17 @@ async fn imports(
 
     detect_import_cycle(
         &mut *state.import_tree.lock().await,
-        task_name.clone(),
-        imports.clone(),
+        task_name,
+        imports,
+        &state.intern,
     )?;
 
-    // TODO do not open cache for nocache items or nocache tasks will wait on recache/normal tasks
-    let file_owner = state.cache_entry_for(imports.clone()).await;
+    let cache = match cache_args {
+        HurlinImportArgs::Normal => HurlinCacheType::Normal(state.cache_entry_for(imports).await),
+        HurlinImportArgs::Nocache => HurlinCacheType::Nocache,
+    };
 
-    run_cacheable_hurlin_task(state, imports, call_stack, cache_args, file_owner).await
+    run_cacheable_hurlin_task(state, imports, call_stack, cache).await
 }
 
 #[axum::debug_handler]
@@ -570,17 +575,20 @@ async fn hurlin_async_call(
 
     detect_import_cycle(
         &mut *state.import_tree.lock().await,
-        task_name.clone(),
-        imports.clone(),
+        task_name,
+        imports,
+        &state.intern,
     )?;
 
     let (key, mut async_key_data) = state.get_unique_async_key(task).await;
 
-    let file_owner = state.cache_entry_for(imports.clone()).await;
+    let cache = match cache_args {
+        HurlinImportArgs::Normal => HurlinCacheType::Normal(state.cache_entry_for(imports).await),
+        HurlinImportArgs::Nocache => HurlinCacheType::Nocache,
+    };
 
     tokio::spawn(async move {
-        let res =
-            run_cacheable_hurlin_task(state, imports, call_stack, cache_args, file_owner).await;
+        let res = run_cacheable_hurlin_task(state, imports, call_stack, cache).await;
 
         *async_key_data = Some(res.into_response());
     });
@@ -601,14 +609,16 @@ async fn hurlin_await(
     State(state): State<Arc<HurlinState>>,
 ) -> Result<Response, StatusCode> {
     let Ok(key) = AsyncKey::validate(await_key.as_ref().map_or("", String::as_str)) else {
-        eprintln!("Could not parse AsyncKey");
+        tracing::error!("Could not parse AsyncKey");
         return Err(StatusCode::BAD_REQUEST);
     };
 
-    if let Some(waitable) = state.async_waits.lock().await.remove(&(key, task)) {
+    let waitable = { state.async_waits.lock().await.remove(&(key, task)) };
+
+    if let Some(waitable) = waitable {
         Ok(waitable.lock().await.take().unwrap())
     } else {
-        eprintln!(
+        tracing::error!(
             "AsyncKey did not exist in wait stack, perhaps something else already claimed it?"
         );
         Err(StatusCode::BAD_REQUEST)
@@ -623,14 +633,14 @@ async fn exports(
 ) -> Result<impl IntoResponse, StatusCode> {
     if let Some(ty) = parts.headers().get(header::CONTENT_TYPE) {
         let Ok(mime) = ty.to_str().map(String::from) else {
-            eprintln!("CONTENT_TYPE provided but not ascii");
+            tracing::error!("CONTENT_TYPE provided but not ascii");
             return Err(StatusCode::BAD_REQUEST);
         };
 
         let body = parts.into_body();
 
         let Ok(bytes) = axum::body::to_bytes(body, 4_000_000).await else {
-            eprintln!("Body exceeds 4MB in size");
+            tracing::error!("Body exceeds 4MB in size");
             return Err(StatusCode::BAD_REQUEST);
         };
 
@@ -677,7 +687,7 @@ async fn main() -> ExitCode {
     let hurl_args = Arc::from_iter(args.hurl);
 
     let Ok(root_f) = args.file.canonicalize_utf8() else {
-        eprintln!("Failed to cannonicalize input file, init failure");
+        tracing::error!("Failed to cannonicalize input file, init failure");
         return ExitCode::FAILURE;
     };
 
@@ -707,11 +717,13 @@ async fn main() -> ExitCode {
 
     let root = TaskId::new();
 
+    let root_f_key = state.intern.get_or_intern(&root_f);
+
     state
         .running_tasks
         .lock()
         .await
-        .insert(root, vec![root_f.clone()]);
+        .insert(root, vec![root_f_key]);
 
     let res = hurlin_spawn(root_f, [], state.clone(), root).await.unwrap();
 
@@ -726,7 +738,7 @@ async fn main() -> ExitCode {
     );
 
     if !res.status.success() {
-        eprintln!("Root hurlin task failed to run to completion");
+        tracing::error!("Root hurlin task failed to run to completion");
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS

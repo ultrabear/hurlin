@@ -56,3 +56,25 @@ impl<'a, Ansi: Display> Display for HighlightFile<'a, Ansi> {
         write!(f, "{parent}/\x1b[{}m{file}\x1b[0m", self.1)
     }
 }
+
+pub struct Color<Args: Display>(pub Args);
+
+impl<Args: Display> Display for Color<Args> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "\x1b[{}m", self.0)
+    }
+}
+
+pub struct ScopeColor<Args: Display, T: Display>(Color<Args>, T);
+
+impl<Args: Display, T: Display> ScopeColor<Args, T> {
+    pub fn new(a: Args, text: T) -> Self {
+        Self(Color(a), text)
+    }
+}
+
+impl<Args: Display, T: Display> Display for ScopeColor<Args, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}{}{}", self.0, self.1, Color("0"))
+    }
+}
