@@ -377,7 +377,7 @@ fn detect_import_cycle(
             ScopeColor::new("93;1", "cycle detected in import chain:")
         );
 
-        let imported = cap_dir.to_root(<&Utf8Path>::from(intern.resolve(&imported)));
+        let imported = cap_dir.to_root(intern.resolve(&imported).as_ref());
 
         tracing::error!(
             "{} {}",
@@ -386,7 +386,7 @@ fn detect_import_cycle(
         );
 
         for (i, path) in cycle.iter().enumerate() {
-            let path = cap_dir.to_root(<&Utf8Path>::from(intern.resolve(path)));
+            let path = cap_dir.to_root(intern.resolve(path).as_ref());
 
             let link: &dyn Display = if i == (cycle.len() - 1) {
                 &Hyperlink::from_path_named(&path, HighlightFile(&path, 91)) as _
@@ -430,7 +430,7 @@ async fn run_hurlin_task(
 
     let res = hurlin_spawn(
         state.cap_dir.to_root(&fpath),
-        fpath.parent().expect("please").to_owned(),
+        fpath.parent().unwrap_or("".as_ref()).to_owned(),
         [],
         state.clone(),
         task_id,
@@ -829,7 +829,7 @@ async fn main() -> ExitCode {
 
     let res = hurlin_spawn(
         state.cap_dir.to_root(&root_f),
-        root_f.parent().expect("yea").to_owned(),
+        root_f.parent().unwrap_or("".as_ref()).to_owned(),
         [],
         state.clone(),
         root,
