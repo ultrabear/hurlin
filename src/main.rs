@@ -41,12 +41,12 @@ use ansi::{HighlightFile, Hyperlink, ScopeColor};
 type FileNameRef = Spur;
 
 #[derive(Debug, Default)]
-struct ImportTree<Ident> {
-    imports: HashMap<Ident, Vec<Ident>>,
-    imported: HashMap<Ident, Vec<Ident>>,
+struct AcyclicTree<Ident> {
+    children: HashMap<Ident, Vec<Ident>>,
+    reverse_children: HashMap<Ident, Vec<Ident>>,
 }
 
-impl<Ident: Eq + Hash + Copy> ImportTree<Ident> {
+impl<Ident: Eq + Hash + Copy> AcyclicTree<Ident> {
     fn insert_cydet(&mut self, root: Ident, imports: Ident) -> Result<(), Vec<Ident>> {
         let goal = imports;
 
@@ -59,7 +59,7 @@ impl<Ident: Eq + Hash + Copy> ImportTree<Ident> {
                 return Err(n.into_iter().collect());
             }
 
-            if let Some(used) = self.imported.get(last) {
+            if let Some(used) = self.reverse_children.get(last) {
                 for i in used {
                     let mut new = n.clone();
                     new.push(*i);
@@ -69,8 +69,8 @@ impl<Ident: Eq + Hash + Copy> ImportTree<Ident> {
             }
         }
 
-        self.imports.entry(root).or_default().push(imports);
-        self.imported.entry(imports).or_default().push(root);
+        self.children.entry(root).or_default().push(imports);
+        self.reverse_children.entry(imports).or_default().push(root);
 
         Ok(())
     }
@@ -120,7 +120,7 @@ struct HurlinState {
 
     // task management
     import_cache: HandleMap<FileNameRef, CacheEntry>,
-    import_tree: Mutex<ImportTree<FileNameRef>>,
+    import_tree: Mutex<AcyclicTree<FileNameRef>>,
     running_tasks: Mutex<HashMap<TaskId, Vec<FileNameRef>>>,
     exports: Mutex<HashMap<TaskId, TypedBody>>,
     async_waits: HandleMap<(AsyncKey, TaskId), Response>,
@@ -355,7 +355,7 @@ fn hurlin_spawn(
 }
 
 fn detect_import_cycle(
-    itree: &mut ImportTree<FileNameRef>,
+    itree: &mut AcyclicTree<FileNameRef>,
     parent: FileNameRef,
     imported: FileNameRef,
     intern: &lasso::ThreadedRodeo,
@@ -730,8 +730,10 @@ async fn main() -> ExitCode {
     _ = std::io::stdout().lock().write_all(&res.stdout);
     _ = std::io::stderr().lock().write_all(&res.stderr);
 
+    // nothing owns a HurlinState after this...
     server.abort();
 
+    // ...so hurl_calls must have atomically settled
     tracing::debug!(
         "Hurl was spawned {} time(s)",
         state.hurl_calls.load(atomic::Ordering::Relaxed)
