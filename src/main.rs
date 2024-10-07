@@ -332,7 +332,11 @@ fn hurlin_spawn(
 
     state.hurl_calls.fetch_add(1, atomic::Ordering::Relaxed);
 
-    let base_dir = if base_dir == "" { String::new() } else { format!("{base_dir}/") };
+    let base_dir = if base_dir == "" {
+        String::new()
+    } else {
+        format!("{base_dir}/")
+    };
 
     let vars = [
         (
@@ -377,21 +381,21 @@ fn detect_import_cycle(
             ScopeColor::new("93;1", "cycle detected in import chain:")
         );
 
-        let imported = cap_dir.to_root(intern.resolve(&imported).as_ref());
+        let (imported, imported_fmt) = cap_dir.formatted_path(intern.resolve(&imported).as_ref());
 
         tracing::error!(
             "{} {}",
             ScopeColor::new("37", "Attempted to import"),
-            Hyperlink::from_path_named(&imported, HighlightFile(&imported, 91))
+            Hyperlink::from_path_named(&imported, HighlightFile(&imported_fmt, 91))
         );
 
         for (i, path) in cycle.iter().enumerate() {
-            let path = cap_dir.to_root(intern.resolve(path).as_ref());
+            let (path, fmt) = cap_dir.formatted_path(intern.resolve(path).as_ref());
 
             let link: &dyn Display = if i == (cycle.len() - 1) {
-                &Hyperlink::from_path_named(&path, HighlightFile(&path, 91)) as _
+                &Hyperlink::from_path_named(&path, HighlightFile(&fmt, 91)) as _
             } else {
-                &Hyperlink::from_path(path) as _
+                &Hyperlink::from_path_named(path, fmt) as _
             };
 
             tracing::error!(
@@ -444,9 +448,10 @@ async fn run_hurlin_task(
     _ = std::io::stderr().lock().write_all(&res.stderr);
 
     if !res.status.success() {
+        let (path, fmt) = state.cap_dir.formatted_path(&fpath);
         tracing::error!(
             "Hurl task {task_id} ({}) failed to run to completion",
-            state.cap_dir.to_root(&fpath)
+            Hyperlink::from_path_named(path, fmt)
         );
         if let Some(mut cache_this) = cache {
             *cache_this = Some(Err(StatusCode::FAILED_DEPENDENCY));
@@ -526,8 +531,8 @@ async fn callstack_info(
 
     let Ok(fpath) = state.cap_dir.dir.canonicalize(&params) else {
         tracing::error!(
-                "Failed to canonicalize path: {}, it either doesn't exist or exists outside of the cap directory",
-            Hyperlink::from_path(state.cap_dir.to_root(&params))
+                "Failed to canonicalize path: {:?}, it either doesn't exist or exists outside of the cap directory",
+            state.cap_dir.to_root(&params)
         );
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     };
@@ -729,27 +734,27 @@ impl PathDir {
 
                     if tmp.try_exists().unwrap_or(false) {
                         return Ok(PathDir {
-                            dir: fs_utf8::Dir::open_ambient_dir(&dir, authority)?,
+                            dir: fs_utf8::Dir::open_ambient_dir(dir, authority)?,
                             path: dir.to_owned(),
                         });
                     }
                 }
 
                 if let Some(dir) = root_file.parent() {
-                    return Ok(PathDir {
-                        dir: fs_utf8::Dir::open_ambient_dir(&dir, authority)?,
+                    Ok(PathDir {
+                        dir: fs_utf8::Dir::open_ambient_dir(dir, authority)?,
                         path: dir.to_owned(),
-                    });
+                    })
                 } else {
-                    return Err(io::Error::other(
+                    Err(io::Error::other(
                         "root hurlin file passed was `/` or otherwise parentless",
-                    ));
+                    ))
                 }
             }
         }
     }
 
-    fn from_root(&self, path: &Utf8Path) -> io::Result<Utf8PathBuf> {
+    fn canonicalize_ambient(&self, path: &Utf8Path) -> io::Result<Utf8PathBuf> {
         let canon = path.canonicalize_utf8()?;
 
         let path = match canon.strip_prefix(&self.path) {
@@ -766,6 +771,17 @@ impl PathDir {
 
     fn to_root(&self, canon_path: &Utf8Path) -> Utf8PathBuf {
         self.path.join(canon_path)
+    }
+
+    fn fmt_root(&self) -> ScopeColor<&'static str, &Utf8Path> {
+        ScopeColor::new("90", &self.path)
+    }
+
+    fn formatted_path(&self, path: &Utf8Path) -> (Utf8PathBuf, Utf8PathBuf) {
+        (
+            self.to_root(path),
+            AsRef::<Utf8Path>::as_ref(&*self.fmt_root().to_string()).join(path),
+        )
     }
 }
 
@@ -785,7 +801,7 @@ async fn main() -> ExitCode {
 
     let hurl_args = Arc::from_iter(args.hurl);
 
-    let root_f = match dir.from_root(&args.file) {
+    let root_f = match dir.canonicalize_ambient(&args.file) {
         Err(e) => {
             tracing::error!("Failed to cannonicalize input file {:?}: {e}", args.file);
             return ExitCode::FAILURE;
@@ -850,7 +866,11 @@ async fn main() -> ExitCode {
     );
 
     if !res.status.success() {
-        tracing::error!("Root hurlin task failed to run to completion");
+        let (fname, fmt) = state.cap_dir.formatted_path(&root_f);
+        tracing::error!(
+            "Root hurl task {root} ({}) failed to run to completion",
+            Hyperlink::from_path_named(fname, fmt)
+        );
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS

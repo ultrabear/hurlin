@@ -1,3 +1,6 @@
+#![allow(dead_code)]
+
+
 use core::fmt::{self, Display};
 use std::sync::LazyLock;
 
