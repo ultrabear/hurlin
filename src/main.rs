@@ -5,7 +5,6 @@ use std::{
     future::{Future, IntoFuture},
     hash::Hash,
     io::{self, Write},
-    net::Ipv4Addr,
     process::{self, ExitCode},
     sync::{
         atomic::{self, AtomicU64},
@@ -352,6 +351,12 @@ fn hurlin_spawn(
             )),
         ),
         (
+            HurlVarName::new("hurlin-readfile").unwrap(),
+            HurlVar(format!(
+                "http://localhost:{port}/read-file/{key}/{task}/{base_dir}"
+            )),
+        ),
+        (
             HurlVarName::new("hurlin-await").unwrap(),
             HurlVar(format!("http://localhost:{port}/await/{key}/{task}/")),
         ),
@@ -680,6 +685,36 @@ async fn noise(_: HurlinRPC) -> impl IntoResponse {
     )
 }
 
+#[axum::debug_handler]
+async fn hurlin_readfile(
+    HurlinRPC(_, path): HurlinRPC,
+    State(state): State<Arc<HurlinState>>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let path = Utf8PathBuf::from(path.unwrap_or_default());
+
+    let Ok(path) = state.cap_dir.dir.canonicalize(&path) else {
+        tracing::error!(
+                "Failed to canonicalize path: {:?}, it either doesn't exist or exists outside of the cap directory",
+            state.cap_dir.to_root(&path)
+        );
+
+        return Err(StatusCode::NOT_FOUND);
+    };
+
+    let data = match state.cap_dir.dir.read(&path) {
+        Ok(data) => data,
+        Err(e) => {
+            tracing::error!(
+                "Error trying to read file at {:?}: {e}",
+                state.cap_dir.to_root(&path)
+            );
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+
+    Ok(data)
+}
+
 #[derive(clap::Parser)]
 /// MVP: a bolt on hurl wrapper with enhanced functionality
 #[clap(version)]
@@ -811,9 +846,7 @@ async fn main() -> ExitCode {
 
     let fuzz_key = HurlinKey::new();
 
-    let addr = tokio::net::TcpListener::bind((Ipv4Addr::from_bits(0), 0))
-        .await
-        .unwrap();
+    let addr = tokio::net::TcpListener::bind(("::", 0)).await.unwrap();
 
     let port = addr.local_addr().unwrap().port();
 
@@ -822,6 +855,7 @@ async fn main() -> ExitCode {
     let app = Router::new()
         .route("/import/:fuzz_key/:taskid/*params", get(imports))
         .route("/async/:fuzz_key/:taskid/*params", get(hurlin_async_call))
+        .route("/read-file/:fuzz_key/:taskid/*params", get(hurlin_readfile))
         .route("/await/:fuzz_key/:taskid/:param", get(hurlin_await))
         .route("/export/:fuzz_key/:taskid/", post(exports))
         .route("/noise/:fuzz_key/:taskid/", get(noise))
