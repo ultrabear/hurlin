@@ -1,6 +1,6 @@
 pkgname="hurlin"
 pkgver="0.1.4"
-pkgrel="1"
+pkgrel="2"
 pkgdesc="A hurl runner with an HTTP library to import and export from native hurl"
 arch=("x86_64")
 license=("GPL-3.0-or-later")
