@@ -850,9 +850,9 @@ async fn main() -> ExitCode {
     let state = Arc::new(HurlinState::new(fuzz_key, port, hurl_args.clone(), dir));
 
     let app = Router::new()
-        .route("/import/{fuzz_key}/{taskid}/*params", get(imports))
-        .route("/async/{fuzz_key}/{taskid}/*params", get(hurlin_async_call))
-        .route("/read-file/{fuzz_key}/{taskid}/*params", get(hurlin_readfile))
+        .route("/import/{fuzz_key}/{taskid}/{*params}", get(imports))
+        .route("/async/{fuzz_key}/{taskid}/{*params}", get(hurlin_async_call))
+        .route("/read-file/{fuzz_key}/{taskid}/{*params}", get(hurlin_readfile))
         .route("/await/{fuzz_key}/{taskid}/{param}", get(hurlin_await))
         .route("/export/{fuzz_key}/{taskid}/", post(exports))
         .route("/noise/{fuzz_key}/{taskid}/", get(noise))
