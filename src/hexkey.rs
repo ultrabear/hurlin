@@ -35,7 +35,7 @@ impl HexKey {
 
     /// generates a new random taskid
     pub fn new() -> Self {
-        let data: [u8; 8] = rand::thread_rng().gen();
+        let data: [u8; 8] = rand::rng().random();
 
         Self(hex::encode(data).as_bytes().try_into().unwrap())
     }

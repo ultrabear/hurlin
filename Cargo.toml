@@ -12,15 +12,15 @@ lto = "thin"
 overflow-checks=true
 
 [dependencies]
-axum = { version = "0.7.6", features = ["macros", "http2"] }
+axum = { version = "0.8", features = ["macros", "http2"] }
 camino = "1.1.9"
 cap-std = { version = "3.2.0", features = ["fs_utf8"] }
 clap = { version = "4.5.18", features = ["derive"] }
-gethostname = "0.5.0"
+gethostname = "1"
 hex = "0.4.3"
 indexmap = "2.5.0"
 lasso = { version = "0.7.3", features = ["multi-threaded"] }
-rand = "0.8.5"
+rand = "0.9"
 serde = "1.0.210"
 serde_derive = "1.0.210"
 serde_json = "1.0.128"

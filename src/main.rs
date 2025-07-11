@@ -13,7 +13,6 @@ use std::{
 };
 
 use axum::{
-    async_trait,
     body::Bytes,
     extract::{Path, Query, Request, State},
     http::{
@@ -212,7 +211,6 @@ impl HurlVarName {
 
 struct HurlinRPC(TaskId, Option<String>);
 
-#[async_trait]
 impl axum::extract::FromRequestParts<Arc<HurlinState>> for HurlinRPC {
     type Rejection = StatusCode;
 
@@ -274,8 +272,7 @@ struct HurlinImportQuery {
     rest: HashMap<String, String>,
 }
 
-#[async_trait]
-impl<S> axum::extract::FromRequestParts<S> for HurlinImportArgs {
+impl<S: Sync> axum::extract::FromRequestParts<S> for HurlinImportArgs {
     type Rejection = StatusCode;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
@@ -674,7 +671,7 @@ async fn exports(
 }
 
 async fn noise(_: HurlinRPC) -> impl IntoResponse {
-    let data = hex::encode(rand::thread_rng().gen::<[u8; 8]>());
+    let data = hex::encode(rand::rng().random::<[u8; 8]>());
 
     (
         [(CONTENT_TYPE, "application/json")],
