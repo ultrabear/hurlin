@@ -775,7 +775,7 @@ impl PathDir {
                     }
                 }
 
-                if let Some(dir) = root_file.parent() {
+                if let Some(dir) = root_file.canonicalize_utf8()?.parent() {
                     Ok(PathDir {
                         dir: fs_utf8::Dir::open_ambient_dir(dir, authority)?,
                         path: dir.to_owned(),
